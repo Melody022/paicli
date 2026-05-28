@@ -40,25 +40,74 @@ import java.util.function.Supplier;
 
 /**
  * Agent 核心类 - 实现 ReAct 循环
+ *
+ * ReAct 循环是 PaiCLI 的灵魂，流程如下：
+ * 1. 用户输入任务
+ * 2. 组装 system prompt（注入记忆、Skill、外部上下文）
+ * 3. 把对话历史 + 工具定义发给 LLM
+ * 4. LLM 返回响应：
+ *    - 如果包含 tool_calls → 执行工具 → 把工具结果加入对话历史 → 回到步骤 3
+ *    - 如果不包含 tool_calls → 返回最终回答，循环结束
+ * 5. 整个过程有预算控制（token 用量、迭代次数）防止死循环
  */
 public class Agent {
     private static final Logger log = LoggerFactory.getLogger(Agent.class);
+
+    /** LLM 客户端，负责与大模型 API 通信（如 GLM、DeepSeek 等） */
     private LlmClient llmClient;
+
+    /** 工具注册表，管理所有可用工具（read_file、write_file、execute_command 等） */
     private final ToolRegistry toolRegistry;
+
+    /**
+     * 对话历史，ReAct 循环的核心数据结构
+     * 包含所有消息：system（系统提示）、user（用户输入）、assistant（AI 回复）、tool（工具结果）
+     * 每次调 LLM 时会把整个历史发过去，让模型知道之前发生了什么
+     */
     private final List<LlmClient.Message> conversationHistory;
+
+    /** 记忆管理器，负责短期记忆、长期记忆、上下文压缩和检索 */
     private final MemoryManager memoryManager;
+
+    /** 对话历史压缩器，当 conversationHistory 接近窗口上限时，把早期消息压缩成摘要 */
     private final ConversationHistoryCompactor historyCompactor;
+
+    /** 外部上下文提供器（如 MCP resource 索引） */
     private Supplier<String> externalContextSupplier = () -> "";
+
+    /** Skill 注册表，管理可加载的 Skill（预定义的任务模板） */
     private SkillRegistry skillRegistry;
+
+    /** Skill 上下文缓冲区，存储待注入的 Skill 内容 */
     private SkillContextBuffer skillContextBuffer;
+
+    /** 渲染器，负责在终端显示输出（支持流式、Thinking 面板等） */
     private Renderer renderer;
+
+    /** HITL（Human-In-The-Loop）启用状态提供器，用于决定是否需要人工审批 */
     private Supplier<Boolean> hitlEnabledSupplier = () -> false;
+
+    /** 提示词组装器，负责把多个 prompt 模板拼装成完整的 system prompt */
     private final PromptAssembler promptAssembler = PromptAssembler.createDefault();
 
     public Agent(LlmClient llmClient) {
         this(llmClient, new ToolRegistry());
     }
 
+    /**
+     * 构造函数：创建 Agent 实例
+     *
+     * @param llmClient  LLM 客户端（如 GLMClient、DeepSeekClient）
+     * @param toolRegistry 工具注册表，如果为 null 会自动创建一个新的
+     *
+     * 初始化流程：
+     * 1. 创建对话历史列表
+     * 2. 创建记忆管理器（负责短期/长期记忆）
+     * 3. 创建对话历史压缩器
+     * 4. 把记忆管理器的上下文配置同步给工具注册表
+     * 5. 把记忆管理器的 storeFact 方法注册为工具的记忆保存器
+     * 6. 把组装好的 system prompt 作为第一条消息加入对话历史
+     */
     public Agent(LlmClient llmClient, ToolRegistry toolRegistry) {
         this.llmClient = llmClient;
         this.toolRegistry = toolRegistry;
@@ -67,6 +116,7 @@ public class Agent {
         this.historyCompactor = new ConversationHistoryCompactor(llmClient);
         this.toolRegistry.setContextProfile(memoryManager.getContextProfile());
         this.toolRegistry.setMemorySaver(memoryManager::storeFact);
+        // 把 system prompt 作为对话历史的第一条消息
         conversationHistory.add(LlmClient.Message.system(buildSystemPrompt("")));
     }
 
@@ -113,45 +163,65 @@ public class Agent {
     }
 
     /**
-     * 运行 Agent 循环
+     * 运行 Agent 的 ReAct 循环 —— 这是整个 PaiCLI 的核心方法
+     *
+     * 调用链路：
+     * 用户输入 → 组装上下文 → 调 LLM → 有工具调用? → 执行工具 → 结果回填 → 继续循环
+     *                                    └─ 否 → 返回最终回答
+     *
+     * @param userInput 用户输入的任务描述
+     * @return Agent 的最终回答（如果使用了流式渲染，可能返回空字符串）
      */
     public String run(String userInput) {
         log.info("ReAct run started: inputLength={}", userInput == null ? 0 : userInput.length());
+
+        // ========== 第一步：预处理 ==========
+        // 清理历史消息中的图片 payload，避免上下文膨胀
         pruneHistoricalImagePayloads();
-        // 存入短期记忆
+
+        // 把用户输入存入短期记忆，用于后续上下文检索
         memoryManager.addUserMessage(userInput);
         storeExplicitBrowserMemoryHint(userInput);
 
-        // 检索相关长期记忆，注入到 system prompt
+        // ========== 第二步：组装 system prompt ==========
+        // 从长期记忆中检索与当前查询相关的记忆，注入到 system prompt
         ContextProfile contextProfile = memoryManager.getContextProfile();
         String memoryContext = memoryManager.buildContextForQuery(userInput, contextProfile.memoryContextTokens());
         updateSystemPromptWithMemory(memoryContext);
 
-        // 添加用户输入到历史（如有 skill body 注入，前置到原文之前）
+        // 把用户输入加入对话历史（如果有 Skill body，会前置到用户输入之前）
         String userMessageContent = prependSkillBodies(userInput);
         conversationHistory.add(ImageReferenceParser.userMessage(
                 userMessageContent,
                 Path.of(toolRegistry.getProjectPath())));
+
+        // 用于收集 AI 的思考过程（reasoning）
         StringBuilder reasoningTranscript = new StringBuilder();
+        // 流式渲染器，负责实时显示 AI 的思考和回复
         StreamRenderer streamRenderer = new StreamRenderer(renderer());
 
         long startNanos = System.nanoTime();
+        // 创建预算控制器，防止 token 超限或死循环
         AgentBudget budget = AgentBudget.fromLlmClient(llmClient);
         pushStatus(budget, startNanos, "running");
 
-        // 主退出条件 = LLM 自己决定（不再调用工具就返回）；
-        // budget 仅在 token 用尽 / 检测到死循环 / 超出硬轮数时兜底。
+        // ========== 第三步：ReAct 主循环 ==========
+        // 主退出条件 = LLM 自己决定不再调用工具（返回最终回答）
+        // budget 仅在 token 用尽 / 检测到死循环 / 超出硬轮数时兜底退出
         while (true) {
+            // 检查用户是否按了 Ctrl+C 取消
             if (CancellationContext.isCancelled()) {
                 log.info("ReAct run cancelled before iteration");
                 pushStatus(budget, startNanos, "idle");
                 return "⏹️ 已取消当前任务。";
             }
-            // 调 LLM 前评估 conversationHistory 是否接近 window 上限；超阈值就把早期消息压缩成摘要。
-            // 这是与第 3 期 Memory 短期记忆压缩并行的另一道压缩——后者只压 shortTermMemory，
-            // 真正决定下一轮 LLM input token 的是这里。
+
+            // 调 LLM 前的准备工作：
+            // 1. 注入 LSP 诊断信息（如果有的话）
             injectPendingLspDiagnostics();
+            // 2. 检查对话历史是否接近窗口上限，超阈值就压缩早期消息
             maybeCompactHistory();
+            // 3. 检查预算是否用尽
             AgentBudget.ExitReason exitReason = budget.check();
             if (exitReason != AgentBudget.ExitReason.WITHIN_BUDGET) {
                 String description = budget.describeExit(exitReason);
@@ -165,16 +235,24 @@ public class Agent {
             int iteration = budget.beginIteration();
 
             try {
+                // ========== 第四步：调用 LLM ==========
+                // 获取当前所有可用工具的定义（JSON Schema 格式）
                 List<LlmClient.Tool> toolDefinitions = toolRegistry.getToolDefinitions();
                 logRequestContext("react iteration=" + iteration, toolDefinitions);
                 streamRenderer.beginThinking();
-                // 调用 LLM
+
+                // 核心调用：把对话历史 + 工具定义发给 LLM
+                // LLM 会返回：
+                //   - content: 文本回复
+                //   - reasoningContent: 思考过程（深度思考模型支持）
+                //   - toolCalls: 工具调用请求列表（如果有）
                 LlmClient.ChatResponse response = llmClient.chat(
                         conversationHistory,
                         toolDefinitions,
                         streamRenderer
                 );
                 LlmTraceLogger.logReasoning(log, "react iteration=" + iteration, llmClient, response.reasoningContent());
+
                 if (CancellationContext.isCancelled()) {
                     log.info("ReAct run cancelled after LLM response");
                     streamRenderer.finish();
@@ -182,28 +260,33 @@ public class Agent {
                     return "⏹️ 已取消当前任务。";
                 }
 
+                // 记录本轮 token 消耗
                 budget.recordTokens(response.inputTokens(), response.outputTokens(), response.cachedInputTokens());
                 pushStatus(budget, startNanos, "running");
 
-                // 如果有工具调用
+                // ========== 第五步：处理 LLM 响应 ==========
+                // 如果 LLM 返回了工具调用请求
                 if (response.hasToolCalls()) {
                     appendReasoning(reasoningTranscript, response.reasoningContent());
                     log.info("LLM requested {} tool call(s) in iteration {}", response.toolCalls().size(), iteration);
                     budget.recordToolCalls(response.toolCalls());
-                    // 添加助手消息（包含工具调用）
+
+                    // 把助手消息（包含工具调用）加入对话历史
                     conversationHistory.add(LlmClient.Message.assistant(
                             response.reasoningContent(),
                             response.content(),
                             response.toolCalls()
                     ));
 
-                    // 在工具执行前就 flush 本轮流式渲染器，避免 TerminalMarkdownRenderer
-                    // 内部 pending 缓冲区（仅按换行 flush）里的文本被 HITL 提示"跨过"
-                    // 造成标题和内容错位。重置后下一轮迭代的 reasoning/content 会重新打印标题。
+                    // 在工具执行前 flush 流式渲染器，避免显示错位
                     streamRenderer.resetBetweenIterations();
                     renderer().appendToolCalls(response.toolCalls());
 
+                    // ========== 第六步：执行工具 ==========
+                    // 执行所有工具调用，获取结果
                     List<ToolExecutionResult> toolResults = executeToolCalls(response.toolCalls(), iteration);
+
+                    // 把工具结果加入记忆和对话历史
                     for (ToolExecutionResult toolResult : toolResults) {
                         memoryManager.addToolResult(toolResult.name(), toolResult.result());
                         conversationHistory.add(LlmClient.Message.tool(toolResult.id(), toolResult.result()));
@@ -214,7 +297,8 @@ public class Agent {
                     continue;
                 }
 
-                // 没有工具调用，直接返回结果
+                // ========== 第七步：返回最终结果 ==========
+                // LLM 没有调用工具，说明任务完成，返回最终回答
                 appendReasoning(reasoningTranscript, response.reasoningContent());
                 conversationHistory.add(LlmClient.Message.assistant(response.content()));
 
@@ -233,10 +317,12 @@ public class Agent {
                     log.debug("Assistant answer preview: {}", preview(response.content(), 500));
                 }
 
+                // 如果已经通过流式渲染输出过内容，返回空字符串（避免重复显示）
                 if (streamRenderer.hasStreamedOutput()) {
                     streamRenderer.finish();
                     return "";
                 }
+                // 否则格式化并返回完整响应
                 streamRenderer.clearThinkingPanel();
                 return formatUserFacingResponse(reasoningTranscript.toString(), response.content());
 

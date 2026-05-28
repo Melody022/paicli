@@ -10,20 +10,57 @@ import java.util.Map;
 import java.util.UUID;
 
 /**
- * Memory 管理器 - Memory 系统的门面类
+ * Memory 管理器 —— 记忆系统的门面类，为 Agent 提供统一的记忆存取接口
  *
- * 统一管理短期记忆、长期记忆、上下文压缩和检索，
- * 为 Agent 提供简洁的记忆存取接口。
+ * 记忆系统分为三层：
+ * ┌─────────────────────────────────────────────────────────────────────┐
+ * │  短期记忆 (ConversationMemory)                                      │
+ * │  - 存储当前会话的用户输入、AI 回复、工具结果                          │
+ * │  - 会话关闭后丢失                                                    │
+ * │  - 有 token 预算限制，超限会自动压缩                                 │
+ * ├─────────────────────────────────────────────────────────────────────┤
+ * │  长期记忆 (LongTermMemory)                                          │
+ * │  - 存储跨会话的关键事实（如"用户喜欢 JDK 17"、"项目用 Maven 构建"）   │
+ * │  - 持久化到磁盘（~/.paicli/memory/long_term_memory.json）            │
+ * │  - 只通过 /save 或用户明确要求保存                                   │
+ * ├─────────────────────────────────────────────────────────────────────┤
+ * │  上下文管理 (ContextCompressor + TokenBudget)                       │
+ * │  - 监控 token 使用量，接近窗口上限时自动压缩                         │
+ * │  - 压缩方式：把早期对话摘要化，保留关键信息                          │
+ * └─────────────────────────────────────────────────────────────────────┘
+ *
+ * Agent 使用记忆的流程：
+ * 1. 用户输入 → buildContextForQuery() 检索相关长期记忆 → 注入 system prompt
+ * 2. 执行过程中 → addUserMessage() / addAssistantMessage() / addToolResult() 记录短期记忆
+ * 3. 对话结束时 → storeFact() 保存关键事实到长期记忆
+ * 4. 下次启动时 → 这些事实又能被检索回来
  */
 public class MemoryManager {
     private static final Logger log = LoggerFactory.getLogger(MemoryManager.class);
+
+    /** 短期记忆：存储当前会话的对话上下文 */
     private final ConversationMemory shortTermMemory;
+
+    /** 长期记忆：持久化存储跨会话的关键事实 */
     private final LongTermMemory longTermMemory;
+
+    /** 上下文压缩器：当 token 超限时，用 LLM 生成摘要替代原始对话 */
     private final ContextCompressor compressor;
+
+    /** 记忆检索器：根据查询检索最相关的记忆 */
     private final MemoryRetriever retriever;
+
+    /** Token 预算管理器：跟踪 token 使用量 */
     private TokenBudget tokenBudget;
+
+    /** 上下文配置（窗口大小、压缩阈值等） */
     private ContextProfile contextProfile;
 
+    /**
+     * 创建记忆管理器（使用默认配置）
+     *
+     * @param llmClient LLM 客户端（用于压缩时的摘要生成）
+     */
     public MemoryManager(LlmClient llmClient) {
         this(llmClient, ContextProfile.from(llmClient), null);
     }

@@ -29,6 +29,7 @@ final class MemoryQueryTokenizer {
             return tokens;
         }
 
+        // jieba分词
         List<String> words = SEGMENTER.sentenceProcess(query.toLowerCase(Locale.ROOT).trim());
         for (String word : words) {
             String trimmed = word.trim();

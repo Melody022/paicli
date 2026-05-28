@@ -9,29 +9,30 @@ import java.util.List;
 import java.util.Locale;
 
 /**
- * Agent 循环的退出预算。
+ * Agent 循环的退出预算 - 防止死循环的"安全阀"
  *
- * 设计目标是把"是否继续下一轮"的主导权交给 LLM 自己——只要它返回 content 不再调用工具，
- * 循环就退出。本类只承担三种"保险阀"职责，避免模型在异常情况下无限重复同一动作：
+ * 【设计思路】
+ * ReAct 循环中，AI 可能会陷入死循环（不断调用相同的工具、Token 消耗过多等），
+ * 需要一个"安全阀"来强制终止异常循环。
  *
- * 1. Token 预算：累计 input + output token 超过阈值后强制收尾（**默认无限**，仅显式配置时生效）
- * 2. 停滞检测：连续 N 次工具调用使用完全相同的工具名 + 参数，判定为死循环
- * 3. 硬轮数兜底：累计迭代轮数超过 hardMaxIterations，作为兜底防御
+ * 【三大保险机制】
+ * 1. Token 预算：累计 token 超过阈值后强制收尾（默认无限，可通过 -Dpaicli.react.token.budget=N 启用）
+ * 2. 停滞检测：连续 3 次相同的工具调用，判定为死循环
+ * 3. 硬轮数兜底：最多 50 轮迭代
  *
- * 这三个条件按"先到先触发"判定，任何一个命中都会让循环结束。
- *
- * 配置读取顺序（以 {@link #fromSystemProperties()} 为准）：
- * 1. 系统属性：{@code paicli.react.token.budget} / {@code paicli.react.stagnation.window} /
- *    {@code paicli.react.hard.max.iterations}
- * 2. 默认值：token 预算 = Integer.MAX_VALUE（实质不限）/ 连续 3 次相同工具调用 / 50 轮
- *
- * 设计取舍：长上下文模型（GLM-5.1 200k / DeepSeek V4 1M）配合套餐用户的"无限 token"诉求，
- * 默认不再以 80% × window 为硬限——让 LLM 自然停在它该停的地方。需要严格成本控制的
- * 场景（CI / 自动化批跑）通过 {@code -Dpaicli.react.token.budget=N} 显式启用。
- * 死循环防护交给 stagnation 检测和 hardMaxIterations 两道兜底。
+ * 【业务流程中的位置】
+ * 在 SubAgent.execute() 的 ReAct 循环中被调用，每轮迭代前检查是否超限
  */
 public class AgentBudget {
 
+    /**
+     * 退出原因枚举
+     *
+     * - WITHIN_BUDGET：正常，继续执行
+     * - TOKEN_BUDGET_EXCEEDED：Token 消耗过多
+     * - STAGNATION_DETECTED：检测到死循环
+     * - HARD_ITERATION_LIMIT：迭代次数过多
+     */
     public enum ExitReason {
         WITHIN_BUDGET,
         TOKEN_BUDGET_EXCEEDED,

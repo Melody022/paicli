@@ -3,13 +3,20 @@ package com.paicli.agent;
 /**
  * Agent 间通信消息 - Multi-Agent 协作的基本通信单元
  *
- * 消息类型说明：
- * - TASK:      主控分配给子代理的任务
- * - RESULT:    子代理返回的执行结果
- * - FEEDBACK:  检查者对结果的反馈（可能包含改进建议）
- * - APPROVAL:  检查者认可结果
- * - REJECTION: 检查者拒绝结果，需要重新执行
- * - ERROR:     子代理在执行过程中遭遇系统级错误（例如 LLM 调用失败），调用方需识别并优雅处理
+ * 【设计思路】
+ * 使用结构化的消息对象，包含：fromAgent（谁发的）、fromRole（角色）、content（内容）、type（类型）
+ *
+ * 【消息类型说明】
+ * - TASK:      主控分配给子代理的任务（Orchestrator → Worker/Planner）
+ * - RESULT:    子代理返回的执行结果（Worker/Planner → Orchestrator）
+ * - APPROVAL:  检查者认可结果（Reviewer → Orchestrator）
+ * - REJECTION: 检查者拒绝结果，需要重新执行（Reviewer → Orchestrator）
+ * - ERROR:     子代理在执行过程中遭遇系统级错误
+ *
+ * 【业务流程示例】
+ * 1. Orchestrator → Worker: AgentMessage.task("orchestrator", "实现登录接口")
+ * 2. Worker → Orchestrator: AgentMessage.result("worker-1", AgentRole.WORKER, "已实现...")
+ * 3. Reviewer → Orchestrator: AgentMessage.approval("reviewer", "审查通过")
  */
 public record AgentMessage(
         String fromAgent,
@@ -17,6 +24,15 @@ public record AgentMessage(
         String content,
         Type type
 ) {
+    /**
+     * 消息类型枚举 - 定义消息的意图
+     *
+     * 【业务含义】
+     * - TASK: 任务分配（从上到下）
+     * - RESULT: 执行结果（从下到上）
+     * - APPROVAL/REJECTION: 审查结果（横向）
+     * - ERROR: 错误通知（任意方向）
+     */
     public enum Type {
         TASK,
         RESULT,

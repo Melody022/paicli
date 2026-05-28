@@ -32,10 +32,25 @@ import java.util.Map;
 import java.util.function.Supplier;
 
 /**
- * 子代理 - 可配置角色的轻量 Agent
+ * 子代理 - Multi-Agent 系统中的可配置角色
  *
- * 每个 SubAgent 有独立的角色、系统提示词和对话历史，
- * 但共享 LLM 客户端和工具注册表。
+ * 【设计思路】
+ * SubAgent 是 Multi-Agent 系统的基本执行单元，每个 SubAgent 都有：
+ * - 独立的角色（PLANNER, WORKER, REVIEWER）
+ * - 独立的系统提示词（根据角色不同）
+ * - 独立的对话历史
+ * - 共享的 LLM 客户端和工具注册表
+ *
+ * 【角色分工】
+ * - PLANNER：只输出 JSON 计划，不调用工具
+ * - WORKER：调用工具完成任务，是唯一能调用工具的角色
+ * - REVIEWER：只输出审查结果，不调用工具
+ *
+ * 【核心方法】
+ * - execute(task)：执行任务（内部调用 AI，可能多次调用工具）
+ * - executeWithContext(task, context)：执行任务（带上下文，用于 Worker 接收依赖步骤的结果）
+ * - review(originalTask, executionResult)：审查结果（Reviewer 专用）
+ * - clearHistory()：清空对话历史（为下一个任务准备）
  */
 public class SubAgent {
     private static final Logger log = LoggerFactory.getLogger(SubAgent.class);
@@ -154,8 +169,29 @@ public class SubAgent {
     }
 
     /**
-     * 执行任务并将流式输出写入指定 PrintStream。并发执行时为每个步骤传入独立的 PrintStream，
-     * 避免多个 Agent 同时写入 System.out 造成输出交错。
+     * 执行任务 - SubAgent 的核心方法（ReAct 循环）
+     *
+     * 【设计思路】
+     * 实现 ReAct 循环（Reasoning + Acting）：
+     * 1. 接收任务
+     * 2. 调用 AI 模型
+     * 3. AI 分析任务，决定下一步行动
+     * 4. 如果 AI 决定调用工具，执行工具，把结果加入对话历史，回到步骤 2
+     * 5. 如果 AI 不再调用工具，返回最终结果
+     *
+     * 【ReAct 循环的优势】
+     * - AI 可以看到之前的操作结果，做出更好的决策
+     * - 支持多轮工具调用，完成复杂任务
+     * - 预算控制，防止死循环
+     *
+     * 【工具调用限制】
+     * - 只有 WORKER 角色才能调用工具（shouldUseTools() == true）
+     * - PLANNER 和 REVIEWER 只输出分析结果，不调用工具
+     *
+     * 【业务流程示例】执行任务："设计用户表结构"
+     *   第 1 轮：AI 决策调用 search_code("user") → 找到 User.java
+     *   第 2 轮：AI 决策调用 read_file("User.java") → 返回文件内容
+     *   第 3 轮：AI 不再调用工具，输出最终结果
      */
     public AgentMessage execute(AgentMessage task, PrintStream out) {
         log.info("[{}] executing task from {}: type={}", name, task.fromAgent(), task.type());
@@ -246,6 +282,19 @@ public class SubAgent {
         return executeWithContext(task, context, System.out);
     }
 
+    /**
+     * 执行任务（带上下文注入）- Worker 专用
+     *
+     * 【设计思路】
+     * Worker 执行任务时，需要知道前置依赖步骤的结果。
+     * 例如：实现登录接口时，需要知道数据库表结构设计。
+     *
+     * 这个方法将上下文信息注入到任务描述中，让 Worker 能够看到前置步骤的结果，做出更好的决策。
+     *
+     * 【业务流程示例】执行 step_2："实现登录接口"
+     *   上下文（step_1 的结果）："已完成的依赖步骤 [step_1]: 设计数据库表结构..."
+     *   注入后的任务："已完成的依赖步骤 [step_1]: 设计数据库表结构...\n\n当前任务：实现登录接口"
+     */
     public AgentMessage executeWithContext(AgentMessage task, String context, PrintStream out) {
         String enrichedContent = task.content();
         if (context != null && !context.isEmpty()) {
@@ -263,6 +312,20 @@ public class SubAgent {
         return review(originalTask, executionResult, System.out);
     }
 
+    /**
+     * 检查结果（Reviewer 专用）
+     *
+     * 【设计思路】
+     * Reviewer 的职责是检查 Worker 的执行结果是否合格。
+     * 将原始任务和执行结果组合成审查任务，交给 Reviewer 分析。
+     *
+     * 【审查结果格式】JSON 格式，包含 approved（是否通过）、issues（问题）、suggestions（建议）
+     *
+     * 【业务流程示例】
+     *   原始任务："实现登录接口"
+     *   执行结果："已实现登录接口..."
+     *   审查结果：{"approved": false, "issues": ["缺少 JWT token 生成"]}
+     */
     public AgentMessage review(String originalTask, String executionResult, PrintStream out) {
         String reviewInput = "原始任务：" + originalTask + "\n\n执行结果：\n" + executionResult;
         AgentMessage reviewTask = AgentMessage.task("orchestrator", reviewInput);
@@ -298,7 +361,15 @@ public class SubAgent {
     }
 
     /**
-     * 只有执行者需要工具；规划者和检查者都只输出分析结果。
+     * 判断是否应该使用工具
+     *
+     * 【设计思路】
+     * 只有 WORKER 角色才能调用工具：
+     * - PLANNER：只输出 JSON 计划，不调用工具
+     * - WORKER：调用工具完成任务，是唯一能调用工具的角色
+     * - REVIEWER：只输出审查结果，不调用工具
+     *
+     * 【为什么这样设计？】专注才能高效，每个角色只做自己擅长的事
      */
     private boolean shouldUseTools() {
         return role == AgentRole.WORKER;
@@ -314,6 +385,22 @@ public class SubAgent {
         log.info("[{}] injected LSP diagnostics into sub-agent conversation", name);
     }
 
+    /**
+     * 执行工具调用 - ReAct 循环的核心
+     *
+     * 【设计思路】
+     * AI 决定调用工具后，这个方法负责：
+     * 1. 解析工具调用请求（工具名、参数）
+     * 2. 调用工具注册表执行工具
+     * 3. 收集执行结果
+     * 4. 支持并行执行多个工具调用
+     *
+     * 【业务流程示例】
+     *   AI 决策：调用 search_code("user") 和 read_file("User.java")
+     *   解析为两个 ToolInvocation
+     *   调用 toolRegistry.executeTools(invocations) 并行执行
+     *   返回两个结果
+     */
     private List<ToolExecutionResult> executeToolCalls(List<LlmClient.ToolCall> toolCalls) {
         List<ToolInvocation> invocations = new ArrayList<>();
         for (LlmClient.ToolCall toolCall : toolCalls) {

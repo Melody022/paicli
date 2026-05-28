@@ -131,7 +131,30 @@ public class AgentOrchestrator {
     }
 
     /**
-     * 运行多 Agent 协作任务
+     * 运行多 Agent 协作任务 - Multi-Agent 系统的核心方法
+     *
+     * 【整体流程】分为三个阶段：
+     *
+     * 阶段 1 - 规划：
+     *   - 将用户任务交给 Planner
+     *   - Planner 调用 AI 生成 JSON 计划
+     *   - 解析 JSON 得到步骤列表
+     *
+     * 阶段 2 - 执行（循环）：
+     *   - 识别可执行的步骤（依赖已全部完成）
+     *   - 单步执行：串行流式输出
+     *   - 多步执行：并行执行，使用 Worker 池
+     *   - 每个步骤执行后，Reviewer 审查
+     *   - 审查不通过则重试（最多 2 次）
+     *
+     * 阶段 3 - 汇总：
+     *   - 处理因前置失败而跳过的步骤
+     *   - 收集所有步骤结果，生成最终报告
+     *
+     * 【业务流程示例】用户输入："/team 帮我实现登录功能"
+     *   阶段 1：Planner 生成计划（step_1 设计数据库 → step_2 实现接口 → step_3 实现前端）
+     *   阶段 2：Worker-1 执行 step_1 → Reviewer 审查 → 通过 → Worker-2 执行 step_2 → 重试后通过...
+     *   阶段 3：汇总结果返回用户
      */
     public String run(String userInput) {
         log.info("Multi-Agent run started: inputLength={}", userInput == null ? 0 : userInput.length());
@@ -216,6 +239,13 @@ public class AgentOrchestrator {
 
     /**
      * 解析规划者输出的 JSON 计划
+     *
+     * 【设计思路】
+     * Planner 输出 JSON 格式的计划，需要解析为 ExecutionStep 列表。
+     * 解析过程分两遍：第一遍创建步骤（重编号），第二遍建立依赖关系。
+     *
+     * 【输入格式】Planner 输出的 JSON，包含 steps 数组
+     * 【输出格式】List<ExecutionStep>，每个步骤包含 id、description、type、dependencies
      */
     List<ExecutionStep> parsePlan(String planJson) {
         try {
@@ -281,6 +311,24 @@ public class AgentOrchestrator {
 
     /**
      * 获取当前可执行的步骤（依赖已全部完成）
+     *
+     * 【设计思路】
+     * 这是 Multi-Agent 系统的核心依赖分析方法，实现了"有向无环图（DAG）"的拓扑排序思想：
+     * - 遍历所有步骤
+     * - 过滤出状态为 PENDING（待执行）的步骤
+     * - 检查该步骤的所有依赖是否都已完成（COMPLETED）
+     * - 只有依赖全部完成的步骤才能执行
+     *
+     * 【并行执行支持】
+     * 如果两个步骤的依赖都已完成，它们可以同时返回，支持并行执行
+     *
+     * 【业务流程示例】
+     * step_1: 无依赖，状态 PENDING → 可执行
+     * step_2: 依赖 step_1，状态 PENDING → step_1 未完成，不可执行
+     * step_3: 依赖 step_1 和 step_2，状态 PENDING → 不可执行
+     *
+     * 第 1 轮：返回 [step_1]（只有 step_1 无依赖）
+     * 执行 step_1 后，第 2 轮：返回 [step_2]（step_1 已完成）
      */
     List<ExecutionStep> getExecutableSteps(List<ExecutionStep> steps) {
         Map<String, StepStatus> statusMap = new HashMap<>();
@@ -472,9 +520,26 @@ public class AgentOrchestrator {
     }
 
     /**
-     * 执行单个步骤（Worker 执行 + Reviewer 审查 + 最多 2 次重试）。
+     * 执行单个步骤（Worker 执行 + Reviewer 审查 + 最多 2 次重试）- 核心方法
      *
-     * 此方法被串行和并行两条路径共享，通过 {@code out} 控制流式输出目的地。
+     * 【完整流程】
+     * 1. Worker 执行任务（调用工具完成任务）
+     * 2. Reviewer 审查结果（检查质量）
+     * 3. 判断是否通过
+     *    - 通过：更新步骤状态为 COMPLETED
+     *    - 不通过：进入重试机制（最多 2 次）
+     *
+     * 【重试机制】
+     * - 将 Reviewer 的反馈告诉 Worker
+     * - Worker 带着反馈重新执行
+     * - Reviewer 再次审查
+     * - 重复直到通过或超过重试次数
+     *
+     * 【业务流程示例】执行 step_2："实现登录接口"
+     *   第 1 次执行：Worker 实现接口 → Reviewer 审查 → 不通过（缺少 JWT）
+     *   第 2 次执行（重试）：Worker 添加 JWT → Reviewer 审查 → 通过
+     *
+     * 此方法被串行和并行两条路径共享
      */
     private void runStep(ExecutionStep step, List<ExecutionStep> steps,
                          Map<String, Integer> retryCount,

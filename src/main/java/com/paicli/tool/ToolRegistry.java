@@ -44,39 +44,104 @@ import java.util.concurrent.*;
 import java.util.function.Function;
 
 /**
- * 工具注册表 - 管理所有可用工具
+ * 工具注册表 —— 管理所有可用工具，是 Agent 调用工具的入口
+ *
+ * ToolRegistry 的核心职责：
+ * 1. 注册内置工具（read_file、write_file、execute_command 等）
+ * 2. 注册 MCP 动态工具（mcp__{server}__{tool}）
+ * 3. 提供工具定义给 LLM（getToolDefinitions() → JSON Schema）
+ * 4. 执行工具调用（executeTools() → 并行执行 + 安全检查）
+ *
+ * 工具调用链路：
+ * LLM 返回 tool_calls → ToolRegistry.executeTools() → PathGuard/CommandGuard 安全检查
+ * → HitlToolRegistry 人工审批 → 执行工具函数 → 返回结果 → 回填给 LLM
+ *
+ * 内置 9 个工具：
+ * - 文件操作：read_file、write_file、list_dir
+ * - 命令执行：execute_command
+ * - 项目创建：create_project
+ * - 代码搜索：search_code
+ * - 联网能力：web_search、web_fetch
+ * - 撤销操作：revert_turn
  */
 public class ToolRegistry {
     private static final ObjectMapper mapper = new ObjectMapper();
     private static final int DEFAULT_COMMAND_TIMEOUT_SECONDS = 60;
     private static final int DEFAULT_TOOL_BATCH_TIMEOUT_SECONDS = 90;
+
+    /** 并行执行工具的最大数量，避免资源耗尽 */
     private static final int MAX_PARALLEL_TOOLS = 4;
     private static final int MAX_COMMAND_OUTPUT_CHARS = 8_000;
-    // write_file 单次写入字节数上限。LLM 想塞超大内容时通常是误生成（重复粘贴 / hallucinate 大段日志），
-    // 5MB 对常规代码生成 / 文档撰写完全够用，超过即拒，避免磁盘灌满与误覆盖。
+
+    /**
+     * write_file 单次写入字节数上限（5MB）
+     * LLM 想写超大内容时通常是误生成（重复粘贴 / hallucinate 大段日志），
+     * 超过即拒，避免磁盘灌满与误覆盖
+     */
     private static final int MAX_WRITE_FILE_BYTES = 5 * 1024 * 1024;
-    // 需要审计的内置工具（与 ApprovalPolicy 的 DANGEROUS_TOOLS 保持一致）；MCP 工具按前缀动态纳入审计。
+
+    /** 需要审计的危险工具（与 ApprovalPolicy 的 DANGEROUS_TOOLS 保持一致） */
     private static final Set<String> AUDIT_TOOLS = Set.of("write_file", "execute_command", "create_project", "revert_turn");
+
+    /** 内置工具注册表（key = 工具名，value = Tool 实例） */
     private final Map<String, Tool> tools = new ConcurrentHashMap<>();
+
+    /** MCP 动态工具注册表（key = mcp__{server}__{tool}，value = McpRegisteredTool 实例） */
     private final Map<String, McpRegisteredTool> mcpTools = new ConcurrentHashMap<>();
+
+    /** 命令执行超时时间（秒） */
     private final long commandTimeoutSeconds;
+
+    /** 工具批次超时时间（秒） */
     private final long toolBatchTimeoutSeconds;
     private static final int DEFAULT_FETCH_MAX_CHARS = 8_000;
+
+    /** 项目根目录路径，PathGuard 用它来限制文件操作只能在项目内 */
     private String projectPath = System.getProperty("user.dir");
+
+    /** 路径安全守卫，强制文件操作限定在项目根目录内 */
     private PathGuard pathGuard = new PathGuard(projectPath);
+
+    /** 审计日志，记录所有危险工具的调用 */
     private final AuditLog auditLog = new AuditLog();
+
+    /** 搜索提供商（web_search 工具使用） */
     private SearchProvider searchProvider;
+
+    /** 网页抓取器（web_fetch 工具使用） */
     private WebFetcher webFetcher;
+
+    /** HTML 内容提取器（web_fetch 工具使用） */
     private HtmlExtractor htmlExtractor;
+
+    /** 网络策略（控制哪些 URL 可以访问） */
     private NetworkPolicy networkPolicy;
+
+    /** 上下文配置（token 预算、压缩阈值等） */
     private ContextProfile contextProfile = ContextProfile.from(null);
+
+    /** 浏览器安全守卫 */
     private BrowserGuard browserGuard;
+
+    /** 浏览器连接器（Chrome DevTools MCP 使用） */
     private BrowserConnector browserConnector;
+
+    /** 记忆保存器，用于把工具执行中发现的关键事实保存到长期记忆 */
     private java.util.function.Consumer<String> memorySaver;
+
+    /** Skill 注册表 */
     private SkillRegistry skillRegistry;
+
+    /** Skill 上下文缓冲区 */
     private SkillContextBuffer skillContextBuffer;
+
+    /** write_file 写入观察者，用于接 diff 渲染等只读副作用 */
     private java.util.function.BiConsumer<String, String[]> writeFileObserver = (p, ba) -> {};
+
+    /** LSP 管理器，用于代码诊断 */
     private LspManager lspManager = new LspManager(projectPath);
+
+    /** 快照服务，用于 Side-Git 快照管理 */
     private SnapshotService snapshotService = SnapshotService.forProject(Path.of(projectPath));
     private boolean customSnapshotService;
 
@@ -88,6 +153,23 @@ public class ToolRegistry {
         this(commandTimeoutSeconds, Math.max(commandTimeoutSeconds + 5, DEFAULT_TOOL_BATCH_TIMEOUT_SECONDS));
     }
 
+    /**
+     * 构造函数：初始化工具注册表并注册所有内置工具
+     *
+     * @param commandTimeoutSeconds 命令执行超时时间（秒）
+     * @param toolBatchTimeoutSeconds 工具批次超时时间（秒）
+     *
+     * 注册的工具类别：
+     * 1. 文件操作：read_file、write_file、list_dir
+     * 2. 命令执行：execute_command
+     * 3. 代码搜索：search_code
+     * 4. RAG 检索：rag_index、rag_search
+     * 5. 联网能力：web_search、web_fetch
+     * 6. 浏览器：browser_* 系列
+     * 7. 记忆管理：memory_save
+     * 8. Skill：load_skill
+     * 9. 快照：snapshot_* 系列
+     */
     ToolRegistry(long commandTimeoutSeconds, long toolBatchTimeoutSeconds) {
         this.commandTimeoutSeconds = commandTimeoutSeconds;
         this.toolBatchTimeoutSeconds = toolBatchTimeoutSeconds;
@@ -195,14 +277,21 @@ public class ToolRegistry {
 
     /**
      * 注册文件操作工具
+     *
+     * 包含三个工具：
+     * 1. read_file: 读取文件内容（PathGuard 限定在项目根目录内）
+     * 2. write_file: 写入文件内容（5MB 上限，PathGuard 安全检查）
+     * 3. list_dir: 列出目录内容
      */
     private void registerFileTools() {
-        // read_file 工具
+        // read_file 工具 —— 读取文件内容
+        // LLM 调用示例：{"path": "src/Main.java"}
         tools.put("read_file", new Tool(
                 "read_file",
                 "读取文件内容（仅限项目根目录之内）",
                 createParameters(new Param("path", "string", "文件路径", true)),
                 args -> {
+                    // PathGuard.resolveSafe() 会检查路径是否在项目根目录内，防止目录遍历攻击
                     Path safe = pathGuard.resolveSafe(args.get("path"));
                     try {
                         return "文件内容:\n" + Files.readString(safe);

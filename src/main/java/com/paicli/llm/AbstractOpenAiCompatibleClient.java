@@ -12,14 +12,41 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
 
+/**
+ * OpenAI 兼容协议的抽象基类 —— 封装 HTTP 请求和 SSE 流式解析的核心实现
+ *
+ * 这是所有 LLM 客户端（GLM、DeepSeek、Kimi 等）的公共父类。
+ * 它把与大模型 API 通信的通用逻辑都封装在这里，子类只需要提供：
+ * - getApiUrl(): API 地址
+ * - getModel(): 模型名称
+ * - getApiKey(): API 密钥
+ *
+ * 核心流程（chat 方法）：
+ * 1. 把 Message 列表 + Tool 列表序列化为 JSON 请求体
+ * 2. 发起 HTTP POST 请求到大模型 API
+ * 3. 逐行读取 SSE 流（Server-Sent Events）
+ * 4. 从每个 SSE 数据块中提取 content、reasoning、tool_calls 的增量
+ * 5. 通过 StreamListener 回调通知 UI 层实时显示
+ * 6. 累加所有增量，最终返回完整的 ChatResponse
+ */
 public abstract class AbstractOpenAiCompatibleClient implements LlmClient {
 
+    /** JSON 序列化工具，用于构建请求体和解析响应 */
     protected static final ObjectMapper mapper = new ObjectMapper();
 
-    // SSE 流式接口下，OkHttp 的 readTimeout 是"两次 read 之间的最大间隔"，不是请求总时长。
-    // GLM-5.1 在生成大段 reasoning_content 时服务端可能长时间静默，所以默认值放宽到 300s；
-    // callTimeout 作为整体兜底，覆盖极端情况下的连接半死状态。
-    // 三项均可通过系统属性覆盖，便于不同模型 / 网络环境调优。
+    /**
+     * 共享的 HTTP 客户端，所有 LLM 客户端实例共用
+     *
+     * 超时配置说明：
+     * - connectTimeout: 建立 TCP 连接的超时时间（60s）
+     * - readTimeout: 等待服务器响应的超时时间（300s，因为深度思考模型可能需要很长时间）
+     * - writeTimeout: 发送请求体的超时时间（60s）
+     * - callTimeout: 整个调用的总超时时间（600s）
+     *
+     * 这些超时可以通过 JVM 参数覆盖：
+     * -Dpaicli.llm.connect.timeout.seconds=60
+     * -Dpaicli.llm.read.timeout.seconds=300
+     */
     protected static final OkHttpClient SHARED_HTTP_CLIENT = new OkHttpClient.Builder()
             .connectTimeout(readTimeoutSeconds("paicli.llm.connect.timeout.seconds", 60), TimeUnit.SECONDS)
             .readTimeout(readTimeoutSeconds("paicli.llm.read.timeout.seconds", 300), TimeUnit.SECONDS)
@@ -40,14 +67,34 @@ public abstract class AbstractOpenAiCompatibleClient implements LlmClient {
         }
     }
 
+    /**
+     * 获取 API 的基础 URL（子类实现）
+     * 例如：https://open.bigmodel.cn/api/coding/paas/v4/chat/completions
+     */
     protected abstract String getApiUrl();
 
+    /**
+     * 获取当前使用的模型名称（子类实现）
+     * 例如：glm-5.1、deepseek-chat
+     */
     protected abstract String getModel();
 
+    /**
+     * 获取 API 鉴权密钥（子类实现）
+     */
     protected abstract String getApiKey();
 
+    /**
+     * 是否需要在请求历史中发送 reasoning_content 字段。
+     * <p>
+     * 如果 assistant 消息中有 reasoning_content，说明模型开启了思考模式，
+     * 后续请求中必须将其回传，否则部分 API 会拒绝请求（如 DeepSeek R1、GLM 深度思考）。
+     * <p>
+     * 实际发送前还会检查 {@code msg.reasoningContent() != null && !msg.reasoningContent().isBlank()}，
+     * 所以打开此开关不会影响不返回 reasoning 的模型。
+     */
     protected boolean shouldSendReasoningContentInRequestHistory() {
-        return false;
+        return true;
     }
 
     @Override
@@ -55,14 +102,35 @@ public abstract class AbstractOpenAiCompatibleClient implements LlmClient {
         return chat(messages, tools, StreamListener.NO_OP);
     }
 
+    /**
+     * 执行流式聊天请求 —— 这是与大模型 API 通信的核心方法
+     *
+     * 完整流程：
+     * ┌────────────────────────────────────────────────────────────────────┐
+     * │ 1. buildRequestBody()  把 Message/Tool 列表序列化为 JSON          │
+     * │ 2. HTTP POST 请求     发送到大模型 API                            │
+     * │ 3. 逐行读取 SSE 流    解析 data: 开头的行                         │
+     * │ 4. 提取增量           从每个数据块提取 content/reasoning/tool_calls│
+     * │ 5. 回调通知           通过 StreamListener 实时通知 UI 层           │
+     * │ 6. 累加返回           所有增量累加后返回完整的 ChatResponse        │
+     * └────────────────────────────────────────────────────────────────────┘
+     *
+     * @param messages 对话历史消息列表
+     * @param tools 当前可用的工具定义列表
+     * @param listener 流式事件监听器，用于实时显示 AI 的思考和回复
+     * @return 累加后的完整响应对象
+     */
     @Override
     public ChatResponse chat(List<Message> messages, List<Tool> tools, StreamListener listener) throws IOException {
         StreamListener streamListener = listener == null ? StreamListener.NO_OP : listener;
+
+        // 第一步：构建 JSON 请求体
         RequestBody body = RequestBody.create(
                 buildRequestBody(messages, tools).toString(),
                 MediaType.parse("application/json")
         );
 
+        // 第二步：构建 HTTP 请求（带 Bearer Token 认证）
         Request request = new Request.Builder()
                 .url(getApiUrl())
                 .header("Authorization", "Bearer " + getApiKey())
@@ -70,6 +138,7 @@ public abstract class AbstractOpenAiCompatibleClient implements LlmClient {
                 .post(body)
                 .build();
 
+        // 第三步：发起请求并解析 SSE 响应流
         try (Response response = SHARED_HTTP_CLIENT.newCall(request).execute()) {
             ResponseBody responseBodyObj = response.body();
             if (!response.isSuccessful()) {
@@ -80,35 +149,33 @@ public abstract class AbstractOpenAiCompatibleClient implements LlmClient {
                 throw new IOException("API返回空响应体");
             }
 
+            // 初始化累加器，用于收集流式返回的碎片化数据
             BufferedSource source = responseBodyObj.source();
             String role = "assistant";
-            StringBuilder content = new StringBuilder();
-            StringBuilder reasoning = new StringBuilder();
-            List<ToolCallAccumulator> toolAccumulators = new ArrayList<>();
+            StringBuilder content = new StringBuilder();      // 累加正式回复
+            StringBuilder reasoning = new StringBuilder();    // 累加思考过程
+            List<ToolCallAccumulator> toolAccumulators = new ArrayList<>();  // 累加工具调用
             int inputTokens = 0;
             int outputTokens = 0;
             int cachedInputTokens = 0;
 
+            // 第四步：循环读取 SSE 流，直到连接关闭或收到 [DONE] 标记
             while (!source.exhausted()) {
                 String line = source.readUtf8Line();
-                if (line == null) {
-                    break;
-                }
+                if (line == null) break;
 
                 String trimmed = line.trim();
-                if (trimmed.isEmpty() || !trimmed.startsWith("data:")) {
-                    continue;
-                }
+                // SSE 协议要求数据行以 "data:" 开头，跳过其他行
+                if (trimmed.isEmpty() || !trimmed.startsWith("data:")) continue;
 
                 String payload = trimmed.substring("data:".length()).trim();
-                if (payload.isEmpty()) {
-                    continue;
-                }
-                if ("[DONE]".equals(payload)) {
-                    break;
-                }
+                if (payload.isEmpty()) continue;
+                if ("[DONE]".equals(payload)) break; // 响应结束标记
 
+                // 解析当前数据块的 JSON 内容
                 JsonNode root = mapper.readTree(payload);
+
+                // 提取 Token 使用量统计（通常位于最后一个数据块）
                 JsonNode usage = root.path("usage");
                 if (!usage.isMissingNode()) {
                     inputTokens = usage.path("prompt_tokens").asInt(inputTokens);
@@ -116,40 +183,38 @@ public abstract class AbstractOpenAiCompatibleClient implements LlmClient {
                     cachedInputTokens = parseCachedInputTokens(usage, cachedInputTokens);
                 }
 
+                // 提取内容增量 (Delta)
                 JsonNode choices = root.path("choices");
-                if (!choices.isArray() || choices.isEmpty()) {
-                    continue;
-                }
+                if (!choices.isArray() || choices.isEmpty()) continue;
 
                 JsonNode choice = choices.get(0);
                 JsonNode delta = choice.path("delta");
-                if (delta.isMissingNode() || delta.isNull()) {
-                    delta = choice.path("message");
-                }
-                if (delta.isMissingNode() || delta.isNull()) {
-                    continue;
-                }
+                if (delta.isMissingNode() || delta.isNull()) delta = choice.path("message");
+                if (delta.isMissingNode() || delta.isNull()) continue;
 
+                // 更新角色信息
                 String deltaRole = delta.path("role").asText("");
-                if (!deltaRole.isEmpty()) {
-                    role = deltaRole;
-                }
+                if (!deltaRole.isEmpty()) role = deltaRole;
 
+                // 第五步：提取并回调思考过程增量（深度思考模型支持）
                 String reasoningDelta = extractReasoningDelta(delta);
                 if (!reasoningDelta.isEmpty()) {
                     reasoning.append(reasoningDelta);
-                    streamListener.onReasoningDelta(reasoningDelta);
+                    streamListener.onReasoningDelta(reasoningDelta);  // 通知 UI 显示思考过程
                 }
 
+                // 第六步：提取并回调正式回复增量
                 String contentDelta = delta.path("content").asText("");
                 if (!contentDelta.isEmpty()) {
                     content.append(contentDelta);
-                    streamListener.onContentDelta(contentDelta);
+                    streamListener.onContentDelta(contentDelta);  // 通知 UI 显示回复内容
                 }
 
+                // 合并工具调用增量（LLM 可能分多次发送工具调用的参数）
                 mergeToolCallDeltas(toolAccumulators, delta.path("tool_calls"));
             }
 
+            // 第七步：返回累加后的完整响应
             return new ChatResponse(
                     role,
                     content.toString(),
@@ -162,6 +227,11 @@ public abstract class AbstractOpenAiCompatibleClient implements LlmClient {
         }
     }
 
+    /**
+     * 从响应增量中提取思考过程（Reasoning Content）。
+     * <p>
+     * 兼容不同厂商的字段命名差异，依次尝试 reasoning_content, reasoning 及 reasoning_details。
+     */
     private String extractReasoningDelta(JsonNode delta) {
         String reasoningContent = delta.path("reasoning_content").asText("");
         if (!reasoningContent.isEmpty()) {
@@ -203,6 +273,11 @@ public abstract class AbstractOpenAiCompatibleClient implements LlmClient {
         return cached;
     }
 
+    /**
+     * 构建发送给 LLM 服务器的 JSON 请求体。
+     * <p>
+     * 将内部的 Message 和 Tool 对象序列化为符合 OpenAI 规范的 JSON 结构。
+     */
     private ObjectNode buildRequestBody(List<Message> messages, List<Tool> tools) {
         ObjectNode requestBody = mapper.createObjectNode();
         requestBody.put("model", getModel());
@@ -301,6 +376,12 @@ public abstract class AbstractOpenAiCompatibleClient implements LlmClient {
         return null;
     }
 
+    /**
+     * 合并流式传输中的工具调用分片。
+     * <p>
+     * 由于工具调用的 ID、函数名和参数可能分布在多个 SSE 数据块中，
+     * 该方法负责根据 index 将这些碎片累加到对应的 Accumulator 中。
+     */
     private void mergeToolCallDeltas(List<ToolCallAccumulator> accumulators, JsonNode toolCallsNode) {
         if (toolCallsNode == null || !toolCallsNode.isArray()) {
             return;
@@ -348,6 +429,9 @@ public abstract class AbstractOpenAiCompatibleClient implements LlmClient {
         return toolCalls.isEmpty() ? null : toolCalls;
     }
 
+    /**
+     * 内部辅助类，用于在流式解析过程中临时存储工具调用信息。
+     */
     private static final class ToolCallAccumulator {
         private String id;
         private final StringBuilder name = new StringBuilder();
