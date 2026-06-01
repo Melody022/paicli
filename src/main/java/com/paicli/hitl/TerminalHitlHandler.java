@@ -30,15 +30,16 @@ public class TerminalHitlHandler implements HitlHandler {
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
-    private volatile boolean enabled;
+    private volatile boolean enabled;   // 是否启用 HITL 审批
 
     // 本次会话中已批准"全部放行"的集合（并发安全）
-    private final Set<String> approvedAllByTool = ConcurrentHashMap.newKeySet();
-    private final Set<String> approvedAllByServer = ConcurrentHashMap.newKeySet();
+    private final Set<String> approvedAllByTool = ConcurrentHashMap.newKeySet();    //放行的工具
+    private final Set<String> approvedAllByServer = ConcurrentHashMap.newKeySet();    //放行的MCP server
+    // 输入输出流
+    private final BufferedReader in;    // 输入流
+    private final PrintStream out;    // 输出流
 
-    private final BufferedReader in;
-    private final PrintStream out;
-
+    // 构造器
     public TerminalHitlHandler(boolean enabled) {
         this(enabled,
                 new BufferedReader(new InputStreamReader(System.in, StandardCharsets.UTF_8)),
@@ -68,8 +69,13 @@ public class TerminalHitlHandler implements HitlHandler {
      * 展示审批请求并收集决策；整体 synchronized 以便并发 Agent 调用时序列化。
      */
     @Override
+    //审批入口，加synchronized同一时刻只能有一个线程进入此方法
     public synchronized ApprovalResult requestApproval(ApprovalRequest request) {
+        //1、自动审核通过  2、打印审核请求
+
+        // 提取MCP server名，判断当前工具是否属于某个MCP server
         String mcpServer = ApprovalPolicy.mcpServerName(request.toolName());
+        //判断是否是“每次调用都需要审核”的敏感操作
         boolean sensitivePerCall = request.sensitiveNotice() != null && !request.sensitiveNotice().isBlank();
         if (!sensitivePerCall && isApprovedAllByTool(request.toolName())) {
             out.println("  [HITL] " + request.toolName() + " 已在本次会话中全部放行，自动通过");
@@ -86,16 +92,16 @@ public class TerminalHitlHandler implements HitlHandler {
         if (sensitivePerCall) {
             out.println("⚠️  " + request.sensitiveNotice());
         }
-        out.println(request.toDisplayText());
+        out.println(request.toDisplayText());       //打印审批请求
 
-        return promptUntilDecision(request);
+        return promptUntilDecision(request);    //等待用户输入决策
     }
 
     /**
      * 主交互循环：无法识别的输入会重新提示而非默认放行（fail-safe）。
      */
     private ApprovalResult promptUntilDecision(ApprovalRequest request) {
-        for (int attempt = 0; attempt < 5; attempt++) {
+        for (int attempt = 0; attempt < 5; attempt++) { //最多5次尝试（用户可能输入y/n/s/m/a 以外的字符）
             out.println();
             boolean sensitivePerCall = request.sensitiveNotice() != null && !request.sensitiveNotice().isBlank();
             if (sensitivePerCall) {

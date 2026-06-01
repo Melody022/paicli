@@ -14,6 +14,15 @@ public class MemoryEntry {
     private final Map<String, String> metadata;
     private final int tokenCount;
 
+    /**
+     * 记忆是怎么生成的？
+     * A：根据用户输入和 AI 决策自动生成
+     *
+     * 用户输入 → 创建 CONVERSATION 记忆
+     * 用户说"记住" → 创建 FACT 记忆
+     * 对话过长 → 创建 SUMMARY 记忆
+     * 工具调用 → 创建 TOOL_RESULT 记忆
+     */
     public enum MemoryType {
         CONVERSATION,  // 对话记忆
         FACT,          // 事实记忆（用户偏好、项目信息等）
