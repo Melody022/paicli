@@ -10,9 +10,13 @@ import java.util.Set;
  * 由 Main 持有并注入 ToolRegistry，避免做全局单例污染测试与多会话运行。
  */
 public class BrowserSession {
+    // 浏览器模式：隔离模式或共享模式
     private BrowserMode mode = BrowserMode.ISOLATED;
+    // 浏览器 URL
     private String browserUrl;
+    // Agent最后导航的 URL
     private String lastNavigatedUrl;
+    // Agent打开的标签页（使用LinkedHashSet保持插入顺序）
     private final Set<String> agentOpenedTabs = new LinkedHashSet<>();
 
     public synchronized BrowserMode mode() {

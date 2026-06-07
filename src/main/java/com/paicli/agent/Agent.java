@@ -209,6 +209,7 @@ public class Agent {
         // 主退出条件 = LLM 自己决定不再调用工具（返回最终回答）
         // budget 仅在 token 用尽 / 检测到死循环 / 超出硬轮数时兜底退出
         while (true) {
+            
             // 检查用户是否按了 Ctrl+C 取消
             if (CancellationContext.isCancelled()) {
                 log.info("ReAct run cancelled before iteration");

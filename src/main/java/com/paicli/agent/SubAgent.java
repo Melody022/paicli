@@ -197,9 +197,10 @@ public class SubAgent {
         log.info("[{}] executing task from {}: type={}", name, task.fromAgent(), task.type());
         pruneHistoricalImagePayloads();
         refreshSystemPrompt();
+        //将skill注入user message
         String taskContent = prependSkillBodies(task.content());
 
-        // 将任务注入对话
+        // 将任务加入历史对话
         conversationHistory.add(ImageReferenceParser.userMessage(
                 taskContent,
                 Path.of(toolRegistry.getProjectPath())));
@@ -208,7 +209,7 @@ public class SubAgent {
 
         AgentBudget budget = AgentBudget.fromLlmClient(llmClient);
 
-        // 与 Agent.java 对称：主退出条件 = LLM 自决，budget 仅在 token / 停滞 / 硬轮数兜底。
+        // ========== 第二步：ReAct 主循环 ==========
         while (true) {
             AgentBudget.ExitReason exitReason = budget.check();
             if (exitReason != AgentBudget.ExitReason.WITHIN_BUDGET) {
@@ -227,6 +228,7 @@ public class SubAgent {
             maybeCompactHistory(out);
 
             try {
+                //调用LLM
                 LlmClient.ChatResponse response = llmClient.chat(
                         conversationHistory,
                         shouldUseTools() ? toolRegistry.getToolDefinitions() : null,
@@ -238,7 +240,7 @@ public class SubAgent {
                         response.reasoningContent());
 
                 budget.recordTokens(response.inputTokens(), response.outputTokens(), response.cachedInputTokens());
-
+                //如果 LLM 返回了工具调用请求
                 if (response.hasToolCalls()) {
                     budget.recordToolCalls(response.toolCalls());
                     printToolCalls(out, response.toolCalls());

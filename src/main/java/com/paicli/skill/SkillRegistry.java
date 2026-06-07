@@ -23,10 +23,10 @@ import java.util.stream.Collectors;
  */
 public final class SkillRegistry {
 
-    private final Path builtinCacheRoot;
-    private final Path userSkillsDir;
-    private final Path projectSkillsDir;
-    private final SkillStateStore stateStore;
+    private final Path builtinCacheRoot;    //jar内置skill缓存目录
+    private final Path userSkillsDir;       //用户级skill目录
+    private final Path projectSkillsDir;    //项目级skill目录
+    private final SkillStateStore stateStore;   //skill存储状态
 
     private final Map<String, Skill> skillsByName = new LinkedHashMap<>();
     private final List<String> warnings = new ArrayList<>();
@@ -38,6 +38,7 @@ public final class SkillRegistry {
         this.stateStore = stateStore;
     }
 
+    //加载skill（三层目录）
     public synchronized void reload() {
         skillsByName.clear();
         warnings.clear();

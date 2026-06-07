@@ -234,15 +234,20 @@ public class Main {
                 .dumb(true)
                 .build()) {
             // --- HITL（人工审批）子系统初始化 ---
+            // TerminalHitlHandler: 终端模式下的人工审批处理
             TerminalHitlHandler terminalHitlHandler = new TerminalHitlHandler(false);
+            // SwitchableHitlHandler: 可切换的 HITL 处理器
             SwitchableHitlHandler hitlHandler = new SwitchableHitlHandler(terminalHitlHandler);
+            // HitlToolRegistry: 带审批的 ToolRegistry
             HitlToolRegistry hitlToolRegistry = new HitlToolRegistry(hitlHandler);
+
 
             // --- 浏览器子系统初始化 ---
             // BrowserSession: 管理浏览器连接状态（isolated/shared 两种模式）
-            // BrowserGuard: 拦截敏感页面操作（如自动阻止访问银行网站）
             BrowserSession browserSession = new BrowserSession();
+            // BrowserConnectivityCheck: 检查浏览器是否可访问
             BrowserConnectivityCheck browserConnectivityCheck = new BrowserConnectivityCheck();
+            // BrowserGuard: 拦截敏感页面操作（如自动阻止访问银行网站）
             hitlToolRegistry.setBrowserGuard(new BrowserGuard(browserSession, new SensitivePagePolicy()));
 
             // --- MCP（Model Context Protocol）子系统初始化 ---
@@ -278,6 +283,9 @@ public class Main {
             // ║   - 历史记录（↑↓ 翻找、持久化到文件）                              ║
             // ║   - Bracketed Paste（大段粘贴不会触发逐字处理）                    ║
             // ╚══════════════════════════════════════════════════════════════════╝
+
+            // 创建 LineReader，这是JLine的核心组件
+            //负责读取用户输入、行编辑、Tab 补全、语法高亮、历史记录等
             LineReader lineReader = LineReaderBuilder.builder()
                     .terminal(terminal)
                     .history(new PaiCliHistory())  // 自定义历史：过滤敏感输入（API Key/base64 图片等）
@@ -285,6 +293,7 @@ public class Main {
                             () -> skillRegistryRef.get() == null ? List.of() : skillRegistryRef.get().allSkills()))
                     .highlighter(new PaiCliHighlighter())  // 输入实时高亮
                     .build();
+            // 配置 LineReader 选项
             lineReader.option(LineReader.Option.BRACKETED_PASTE, true);  // 支持整块粘贴
             lineReader.option(LineReader.Option.AUTO_LIST, true);        // Tab 自动列出候选
             lineReader.option(LineReader.Option.AUTO_MENU, true);        // Tab 自动弹出菜单
@@ -337,9 +346,12 @@ public class Main {
             // ║   ~/.paicli/skills/       ← 用户全局自定义 skill                  ║
             // ║   .paicli/skills/          ← 项目级 skill                        ║
             // ╚══════════════════════════════════════════════════════════════════╝
+
+            // 定义三层 skill 目录
+            // 定义三层 skill 目录结构
             Path home = Path.of(System.getProperty("user.home"));
-            Path skillsCacheDir = home.resolve(".paicli/skills-cache");
-            Path userSkillsDir = home.resolve(".paicli/skills");
+            Path skillsCacheDir = home.resolve(".paicli/skills-cache");  // 内置 skill 解压目录
+            Path userSkillsDir = home.resolve(".paicli/skills");         // 用户全局 skill 目录
             Path projectSkillsDir = Path.of(".paicli/skills").toAbsolutePath();
             try {
                 new com.paicli.skill.SkillBuiltinExtractor(skillsCacheDir).extractAll();
@@ -349,9 +361,14 @@ public class Main {
             com.paicli.skill.SkillStateStore skillStateStore = new com.paicli.skill.SkillStateStore(home.resolve(".paicli/skills.json"));
             com.paicli.skill.SkillRegistry skillRegistry = new com.paicli.skill.SkillRegistry(
                     skillsCacheDir, userSkillsDir, projectSkillsDir, skillStateStore);
+           // 加载 skill 列表（内置 + 用户全局 + 项目级）
             skillRegistry.reload();
+            // 保存到AtomicReference
             skillRegistryRef.set(skillRegistry);
+
             com.paicli.skill.SkillContextBuffer skillContextBuffer = new com.paicli.skill.SkillContextBuffer();
+
+            // 注册skill到hitlToolRegistry（带人工审核的tool），使Agent可以调用skill
             hitlToolRegistry.setSkillRegistry(skillRegistry);
             hitlToolRegistry.setSkillContextBuffer(skillContextBuffer);
 
@@ -365,8 +382,12 @@ public class Main {
             // ║                                                                ║
             // ║ DurableTaskManager: 后台持久任务管理（/task add 提交的异步任务）     ║
             // ╚══════════════════════════════════════════════════════════════════╝
+
+            // 创建 Agent
             Agent reactAgent = new Agent(llmClient, hitlToolRegistry);
+            // 配置外部上下文提供器：MCP resource 索引注入 system prompt
             reactAgent.setExternalContextSupplier(mcpServerManager::resourceIndexForPrompt);  // MCP resource 索引注入 system prompt
+
             reactAgent.setSkillRegistry(skillRegistry);      // Skill 列表注入 system prompt
             reactAgent.setSkillContextBuffer(skillContextBuffer);  // 已加载 skill 的内容缓冲
             DurableTaskManager taskManager = openTaskManager(llmClientRef);  // 后台任务管理器
@@ -440,6 +461,7 @@ public class Main {
             while (true) {
                 PromptInput promptInput;
                 try {
+                    // 读取用户输入
                     promptInput = readPromptInput(terminal, lineReader, renderer,
                             nextTaskUsePlanMode || nextTaskUseTeamMode, spaciousPrompt);
                 } catch (UserInterruptException e) {
@@ -447,10 +469,12 @@ public class Main {
                 } catch (EndOfFileException e) {
                     break;  // Ctrl+D 退出
                 }
+                // 清除已接受的输入
                 if (renderer instanceof InlineRenderer inline) {
                     inline.clearAcceptedInput(promptInput.text());
                 }
 
+                // 处理取消输入
                 if (promptInput.canceled()) {
                     if (nextTaskUsePlanMode) {
                         nextTaskUsePlanMode = false;
