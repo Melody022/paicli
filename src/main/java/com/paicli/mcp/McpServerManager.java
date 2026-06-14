@@ -34,35 +34,75 @@ import java.util.concurrent.TimeoutException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
+/**
+ * MCP server 管理器。
+ * <p>
+ * 统一管理所有 MCP server 的生命周期：配置加载 → 并发启动 → 工具注册 → 资源缓存 → 状态监控 → 关闭清理。
+ * 每个配置好的 server 对应一个 {@link McpServer} 实例，包含其 {@link McpClient}、工具列表和运行状态。
+ * </p>
+ * <p>
+ * 核心职责：
+ * <ul>
+ *   <li>配置加载：通过 {@link McpConfigLoader} 合并用户级和项目级 mcp.json</li>
+ *   <li>并发启动：所有 server 并行初始化，支持有界等待（不阻塞 CLI 首屏）</li>
+ *   <li>工具注册：将 MCP 工具注册到 {@link ToolRegistry}，命名格式 {@code mcp__{server}__{tool}}</li>
+ *   <li>资源缓存：通过 {@link McpResourceCache} 缓存 resource 列表，支持增量刷新</li>
+ *   <li>通知路由：监听 server 推送的 tools/resources 变更通知并自动更新</li>
+ *   <li>运维操作：restart / enable / disable / logs 等 /mcp 子命令</li>
+ * </ul>
+ * </p>
+ */
 public class McpServerManager implements AutoCloseable {
+    /** 启动进度打印间隔（5 秒） */
     private static final Duration STARTUP_PROGRESS_INTERVAL = Duration.ofSeconds(5);
 
+    /** 工具注册表，MCP 工具会注册到这里供 Agent 调用 */
     private final ToolRegistry toolRegistry;
+    /** 项目根目录，stdio 子进程的工作目录 */
     private final Path projectDir;
+    /** 配置加载器，合并用户级 + 项目级 mcp.json */
     private final McpConfigLoader configLoader;
+    /** 所有已配置的 server，key 为 server 名称 */
     private final Map<String, McpServer> servers = new ConcurrentHashMap<>();
+    /** 资源缓存，避免每次都向 server 拉取 resource 列表 */
     private final McpResourceCache resourceCache = new McpResourceCache();
 
+    /** 便捷构造：使用默认配置加载器 */
     public McpServerManager(ToolRegistry toolRegistry, Path projectDir) {
         this(toolRegistry, projectDir, new McpConfigLoader(projectDir));
     }
 
+    /**
+     * 完整构造。
+     *
+     * @param toolRegistry 工具注册表
+     * @param projectDir   项目根目录
+     * @param configLoader 配置加载器（可注入以便测试）
+     */
     public McpServerManager(ToolRegistry toolRegistry, Path projectDir, McpConfigLoader configLoader) {
         this.toolRegistry = toolRegistry;
         this.projectDir = projectDir.toAbsolutePath().normalize();
         this.configLoader = configLoader;
     }
 
+    // ==================== 配置加载与启动 ====================
+
+    /**
+     * 加载配置文件中的 server 定义。
+     * <p>合并 ~/.paicli/mcp.json 和 .paicli/mcp.json，清除旧状态并创建 McpServer 占位对象。</p>
+     */
     public void loadConfiguredServers() throws IOException {
         Map<String, McpServerConfig> configs = configLoader.load();
         servers.clear();
         configs.forEach((name, config) -> servers.put(name, new McpServer(name, config)));
     }
 
+    /** 阻塞启动所有 server（兼容旧调用） */
     public void startAll() {
         startAll(null);
     }
 
+    /** 阻塞启动所有 server，并通过 progressOut 输出启动进度 */
     public void startAll(PrintStream progressOut) {
         startAll(progressOut, null);
     }
@@ -75,6 +115,18 @@ public class McpServerManager implements AutoCloseable {
      * bounded wait is supplied, unfinished servers continue starting on daemon
      * threads so the CLI can render the first prompt instead of being held hostage
      * by a slow stdio/http server.
+     */
+    /**
+     * 启动所有已配置的 server。
+     * <p>
+     * 当 {@code maxWait} 为 null 时，保持历史阻塞行为，等待所有 server 达到 READY/ERROR。
+     * 当提供有界等待时间时，未完成的 server 会在后台 daemon 线程继续启动，
+     * CLI 不必被慢启动的 stdio/http server 拖住首屏。
+     * </p>
+     * <p>启动线程池上限 8 个，避免 npx/uvx 冷启动期间占满 ForkJoinPool.commonPool。</p>
+     *
+     * @param progressOut 进度输出流，为 null 时不打印进度
+     * @param maxWait     最大等待时间，null 表示无限等待
      */
     public void startAll(PrintStream progressOut, Duration maxWait) {
         List<McpServer> targets = servers.values().stream()
@@ -120,6 +172,7 @@ public class McpServerManager implements AutoCloseable {
         }
     }
 
+    /** 超时后打印仍在启动中的 server 列表，提示用户可用 /mcp 查看状态 */
     private void printStartupTimeout(List<McpServer> targets, PrintStream out, Duration maxWait) {
         if (out == null) {
             return;
@@ -142,6 +195,7 @@ public class McpServerManager implements AutoCloseable {
         out.flush();
     }
 
+    /** 启动进度打印线程：每隔固定间隔输出仍在 STARTING 状态的 server 及已等待时间 */
     private Thread startProgressPrinter(List<McpServer> targets, PrintStream out, Duration interval) {
         if (out == null || targets.isEmpty()) {
             return null;
@@ -175,6 +229,15 @@ public class McpServerManager implements AutoCloseable {
         return thread;
     }
 
+    // ==================== 运维操作（/mcp 子命令）====================
+
+    /**
+     * 重启指定 server。
+     * <p>流程：卸载旧工具 → 关闭旧连接 → 取消 disabled → 重新执行完整启动流程。</p>
+     *
+     * @param name server 名称
+     * @return 操作结果消息
+     */
     public synchronized String restart(String name) {
         McpServer server = servers.get(name);
         if (server == null) {
@@ -189,6 +252,10 @@ public class McpServerManager implements AutoCloseable {
                 : "❌ MCP server 重启失败: " + name + " - " + server.errorMessage();
     }
 
+    /**
+     * 使用新参数重启指定 server。
+     * <p>先覆盖 config 中的 args（如切换 --headless 等），再走标准重启流程。</p>
+     */
     public synchronized String restartWithArgs(String name, List<String> args) {
         McpServer server = servers.get(name);
         if (server == null) {
@@ -198,10 +265,15 @@ public class McpServerManager implements AutoCloseable {
         return restart(name);
     }
 
+    /** 获取指定 server 实例（可能为 null） */
     public McpServer server(String name) {
         return servers.get(name);
     }
 
+    /**
+     * 禁用指定 server。
+     * <p>卸载工具、关闭连接、标记 disabled 状态，但保留配置以便后续 enable。</p>
+     */
     public synchronized String disable(String name) {
         McpServer server = servers.get(name);
         if (server == null) {
@@ -215,6 +287,10 @@ public class McpServerManager implements AutoCloseable {
         return "⏸️ MCP server 已禁用: " + name;
     }
 
+    /**
+     * 启用已禁用的 server。
+     * <p>取消 disabled 标记后立即执行完整启动流程。</p>
+     */
     public synchronized String enable(String name) {
         McpServer server = servers.get(name);
         if (server == null) {
@@ -227,6 +303,7 @@ public class McpServerManager implements AutoCloseable {
                 : "❌ MCP server 启用失败: " + name + " - " + server.errorMessage();
     }
 
+    /** 获取指定 server 的 stderr 日志（用于调试和错误排查） */
     public String logs(String name) {
         McpServer server = servers.get(name);
         if (server == null) {
@@ -239,12 +316,19 @@ public class McpServerManager implements AutoCloseable {
         return String.join(System.lineSeparator(), lines);
     }
 
+    /** 获取所有 server 实例（按名称排序） */
     public Collection<McpServer> servers() {
         return servers.values().stream()
                 .sorted(java.util.Comparator.comparing(McpServer::name))
                 .toList();
     }
 
+    // ==================== 状态展示 ====================
+
+    /**
+     * 格式化所有 server 状态（用于 /mcp 命令输出）。
+     * <p>每行展示：server 名、状态、传输类型、工具数、运行时长、PID、错误信息。</p>
+     */
     public String formatStatus() {
         StringBuilder sb = new StringBuilder("🔌 MCP Servers\n");
         if (servers.isEmpty()) {
@@ -272,6 +356,10 @@ public class McpServerManager implements AutoCloseable {
         return sb.toString().trim();
     }
 
+    /**
+     * 生成启动摘要（用于 CLI 首屏 / Banner）。
+     * <p>汇总所有 server 的启动状态和工具数量，格式紧凑。</p>
+     */
     public String startupSummary() {
         if (servers.isEmpty()) {
             return "🔌 MCP server：未配置（可创建 ~/.paicli/mcp.json 或 .paicli/mcp.json）";
@@ -297,10 +385,22 @@ public class McpServerManager implements AutoCloseable {
         return sb.toString();
     }
 
+    // ==================== 资源（Resources）====================
+
+    /** 获取所有缓存的资源描述符（供补全器和 mention 展开使用） */
     public List<McpResourceDescriptor> resourceCandidates() {
         return resourceCache.all();
     }
 
+    /**
+     * 生成资源索引文本（注入 system prompt）。
+     * <p>
+     * 仅包含 URI 和描述，不含正文。
+     * 长上下文模式下模型可参考此索引判断是否需要读取 resource，
+     * 需要正文时再调用对应 MCP resource 工具或使用用户显式 @-mention。
+     * 最多输出 200 条。
+     * </p>
+     */
     public String resourceIndexForPrompt() {
         List<McpResourceDescriptor> resources = resourceCache.all().stream()
                 .sorted(Comparator.comparing(McpResourceDescriptor::serverName)
@@ -329,6 +429,7 @@ public class McpServerManager implements AutoCloseable {
         return sb.toString().trim();
     }
 
+    /** 查看指定 server 的资源列表（用于 /mcp resources 命令） */
     public String resources(String serverName) {
         McpServer server = servers.get(serverName);
         if (server == null) {
@@ -345,6 +446,7 @@ public class McpServerManager implements AutoCloseable {
         }
     }
 
+    /** 查看指定 server 的提示词模板列表（用于 /mcp prompts 命令） */
     public String prompts(String serverName) {
         McpServer server = servers.get(serverName);
         if (server == null) {
@@ -368,6 +470,21 @@ public class McpServerManager implements AutoCloseable {
         }
     }
 
+    /**
+     * 通过 @-mention 读取资源内容。
+     * <p>
+     * 步骤：
+     * 1. 校验 server 存在且就绪
+     * 2. 若该 server 的资源缓存过期，先刷新
+     * 3. 调用 client.readResource 获取内容
+     * 4. 更新缓存并记录审计日志
+     * </p>
+     *
+     * @param serverName server 名称
+     * @param uri        资源 URI
+     * @return 读取结果（含内容和 mimeType）
+     * @throws IOException server 不存在、未就绪或读取失败时抛出
+     */
     public ResourceReadResult readResourceForMention(String serverName, String uri) throws IOException {
         McpServer server = servers.get(serverName);
         if (server == null) {
@@ -398,6 +515,23 @@ public class McpServerManager implements AutoCloseable {
         }
     }
 
+    // ==================== 单 server 启动流程 ====================
+
+    /**
+     * 启动单个 server 的完整流程。
+     * <p>
+     * 步骤：
+     * 1. 清理旧工具和连接
+     * 2. 若已 disabled，标记状态后返回
+     * 3. 展开配置中的 ${VAR} 并校验 transport
+     * 4. 创建传输层（stdio / HTTP）
+     * 5. 创建 McpClient 并执行初始化握手
+     * 6. 注册通知处理器（tools/resources 变更监听）
+     * 7. 拉取工具列表并注册到 ToolRegistry
+     * 8. 标记 READY 状态
+     * </p>
+     * <p>任何步骤失败都会关闭连接并标记 ERROR 状态，不会阻塞其他 server。</p>
+     */
     private void start(McpServer server) {
         unregisterTools(server);
         server.close();
@@ -428,6 +562,13 @@ public class McpServerManager implements AutoCloseable {
         }
     }
 
+    /**
+     * 构建 server 的完整工具列表。
+     * <p>
+     * 包括 server 原生工具 + resources 虚拟工具（若 server 支持 resources）。
+     * 同时刷新资源缓存，并校验无重复工具名。
+     * </p>
+     */
     private List<McpToolDescriptor> buildToolList(McpServer server, McpClient client) throws IOException {
         List<McpToolDescriptor> tools = new ArrayList<>(client.listTools());
         if (client.supportsResources()) {
@@ -439,6 +580,14 @@ public class McpServerManager implements AutoCloseable {
         return tools;
     }
 
+    /**
+     * 将工具注册到 ToolRegistry。
+     * <p>
+     * 对每个工具生成调用 lambda：
+     * 资源虚拟工具走 {@link McpResourceTool} 本地处理，
+     * 普通工具透传到 server 的 tools/call。
+     * </p>
+     */
     private void replaceTools(McpServer server, McpClient client, List<McpToolDescriptor> tools) {
         toolRegistry.replaceMcpToolOutputsForServer(server.name(), tools,
                 descriptor -> isResourceVirtualTool(descriptor)
@@ -446,11 +595,23 @@ public class McpServerManager implements AutoCloseable {
                         : args -> invokeMcpToolOutput(client, descriptor, args));
     }
 
+    /** 判断是否为资源虚拟工具（list_resources / read_resource） */
     private boolean isResourceVirtualTool(McpToolDescriptor descriptor) {
         return McpResourceTool.LIST_RESOURCES.equals(descriptor.name())
                 || McpResourceTool.READ_RESOURCE.equals(descriptor.name());
     }
 
+    /**
+     * 注册 server 通知处理器。
+     * <p>
+     * 监听三类通知：
+     * <ul>
+     *   <li>{@code tools/list_changed} — 工具列表变更，重新拉取并注册</li>
+     *   <li>{@code resources/list_changed} — 资源列表变更，使 server 级缓存失效</li>
+     *   <li>{@code resources/updated} — 单个资源更新，使该 URI 缓存失效</li>
+     * </ul>
+     * </p>
+     */
     private void registerNotificationHandlers(McpServer server, McpClient client) {
         NotificationRouter router = new NotificationRouter();
         router.on("notifications/tools/list_changed", ignored -> {
@@ -472,6 +633,7 @@ public class McpServerManager implements AutoCloseable {
         client.onNotification(router);
     }
 
+    /** 从 server 重新拉取并缓存资源列表（按 URI 排序） */
     private List<McpResourceDescriptor> refreshResources(McpServer server) throws IOException {
         List<McpResourceDescriptor> resources = server.client().listResources();
         resources = resources.stream()
@@ -485,6 +647,16 @@ public class McpServerManager implements AutoCloseable {
      * MCP 工具执行入口：把 LLM 给的 JSON 参数透传给 server 的 tools/call，并把异常转成 LLM 可读字符串。
      * 提取成独立方法是为了让 server 维度的错误信息（serverName/toolName）在堆栈和日志里清晰可见。
      */
+    // ==================== 内部工具方法 ====================
+
+    /**
+     * MCP 工具执行入口。
+     * <p>
+     * 把 LLM 给的 JSON 参数透传给 server 的 tools/call，
+     * 并把异常转成 LLM 可读的错误字符串（而非抛出），
+     * 避免单个工具失败导致整个 ReAct 循环中断。
+     * </p>
+     */
     private static ToolOutput invokeMcpToolOutput(McpClient client, McpToolDescriptor descriptor, String argumentsJson) {
         try {
             return client.callToolOutput(descriptor.name(), argumentsJson);
@@ -494,6 +666,10 @@ public class McpServerManager implements AutoCloseable {
         }
     }
 
+    /**
+     * 根据配置创建传输层实例。
+     * <p>HTTP 配置创建 {@link StreamableHttpTransport}，否则创建 {@link StdioTransport} 子进程。</p>
+     */
     private McpTransport createTransport(McpServerConfig config) throws IOException {
         if (config.isHttp()) {
             return new StreamableHttpTransport(config.getUrl(), config.getHeaders());
@@ -501,6 +677,7 @@ public class McpServerManager implements AutoCloseable {
         return new StdioTransport(config.getCommand(), config.getArgs(), config.getEnv(), projectDir);
     }
 
+    /** 校验工具列表中无重复名称，重复时抛异常阻止注册 */
     private void validateNoDuplicateTools(String serverName, List<McpToolDescriptor> tools) {
         Map<String, Integer> counts = new LinkedHashMap<>();
         for (McpToolDescriptor tool : tools) {
@@ -515,6 +692,7 @@ public class McpServerManager implements AutoCloseable {
         }
     }
 
+    /** 从 ToolRegistry 卸载指定 server 的所有工具 */
     private void unregisterTools(McpServer server) {
         for (McpToolDescriptor tool : server.tools()) {
             toolRegistry.unregisterMcpTool(tool.namespacedName());
@@ -522,11 +700,27 @@ public class McpServerManager implements AutoCloseable {
         server.tools(List.of());
     }
 
+    /** 纳秒时间戳转毫秒差值（用于审计日志的耗时记录） */
     private static long elapsedMillis(long startedAtNanos) {
         return java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAtNanos);
     }
 
+    /**
+     * 资源读取结果。
+     * <p>
+     * 封装从 MCP server 读取的资源内容和 MIME 类型，
+     * 供 mention 展开器将资源内容注入 Agent 上下文。
+     * </p>
+     */
     public record ResourceReadResult(String content, String mimeType) {
+
+        /**
+         * 从 MCP 资源内容列表构造读取结果。
+         * <p>
+         * 文本内容直接拼接，二进制内容显示 base64 blob 长度占位。
+         * MIME 类型取第一个非空值。
+         * </p>
+         */
         static ResourceReadResult from(List<McpResourceContent> contents) {
             if (contents == null || contents.isEmpty()) {
                 return new ResourceReadResult("", "text/plain");
@@ -550,6 +744,7 @@ public class McpServerManager implements AutoCloseable {
         }
     }
 
+    /** 时长格式化：秒 → "Xs"，分 → "Xm"，小时 → "Xh" */
     private static String formatDuration(Duration duration) {
         long seconds = duration.toSeconds();
         if (seconds < 60) return seconds + "s";
@@ -558,6 +753,10 @@ public class McpServerManager implements AutoCloseable {
         return (minutes / 60) + "h";
     }
 
+    /**
+     * 关闭所有 server。
+     * <p>遍历所有 server 卸载工具并关闭连接，由 McpServerManager 的 AutoCloseable 语义触发。</p>
+     */
     @Override
     public void close() {
         for (McpServer server : servers.values()) {
