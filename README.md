@@ -1,4 +1,4 @@
-# paiCLI
+# sharkCLI
 
 一个成熟的 Java Agent CLI 产品，对标 Claude Code 
 
