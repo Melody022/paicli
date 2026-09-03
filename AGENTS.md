@@ -10,11 +10,11 @@
 
 ## 项目快照
 
-- 项目名：`PaiCLI`
+- 项目名：`sharkCli`
 - 定位：面向商业使用的 Java Agent CLI 产品，对标 Claude Code
 - 已交付 21 期（ReAct → Plan+DAG → Memory → RAG → Multi-Agent → HITL → 并行工具 → 多模型 → 联网 → MCP 核心 → MCP 高级 → 长上下文 → Chrome DevTools → CDP 会话复用 → Skill → TUI → LSP 诊断 → Side-Git 快照 → Prompt 分层 → Runtime API → 图片输入）
 - 下一步：OAuth / sampling / recovery 作为后续 MCP 增强
-- Banner 版本：`v16.1.0`，Maven 产物：`paicli-1.0-SNAPSHOT.jar`（两者不一致是正常状态）
+- Banner 版本：`v16.1.0`，Maven 产物：`sharkcli-1.0-SNAPSHOT.jar`（两者不一致是正常状态）
 
 ## 运行前提
 
@@ -26,7 +26,7 @@
 ```bash
 cp .env.example .env
 mvn clean package        # 默认跳过测试，优先产出可手工验收 jar
-java -jar target/paicli-1.0-SNAPSHOT.jar
+java -jar target/sharkcli-1.0-SNAPSHOT.jar
 mvn test -Pquick          # 常规回归
 mvn test -Pphase16-smoke  # TUI 相关
 mvn test -Dtest=XxxTest -DskipTests=false   # 针对性
@@ -50,7 +50,7 @@ MCP 动态工具：`mcp__{server}__{tool}`（+ resources 虚拟工具）
 ## 仓库结构
 
 ```
-src/main/java/com/paicli/
+src/main/java/com/sharkcli/
 ├── agent/       Agent.java, PlanExecuteAgent.java, SubAgent.java, AgentOrchestrator.java
 ├── cli/         Main.java, CliCommandParser.java, PlanReviewInputParser.java
 ├── browser/     BrowserSession, BrowserGuard, SensitivePagePolicy
@@ -85,11 +85,11 @@ src/main/java/com/paicli/
 - Phase 22 开始，`InlineRenderer` 可绑定当前 `LineReader`；当 `LineReader.isReading()` 为 true 时，`Renderer.stream()` 的完整行输出优先通过 `LineReader#printAbove` 显示在输入行上方，未绑定 / 非读取态 / 测试路径回退到原 `PrintStream`。
 - ReAct 正常结束后不再把 `📊 Token: ...` 打进正文区；token/cost/elapsed 会保留在底部强状态行，phase 回到 `idle`。
 - 默认 CLI 启动路径应尽早建立 `Terminal -> LineReader -> Renderer`，启动 Banner、模型加载、MCP 启动、Skill summary、ReAct 提示和退出提示都应走 `Renderer.stream()`；除 fatal bootstrap / runtime API / legacy TUI 降级外，不要在交互主路径新增裸 `System.out.println`。
-- 启动期 MCP 不得阻塞首屏：CLI 默认最多等待 8 秒（`PAICLI_MCP_STARTUP_WAIT_SECONDS` / `-Dpaicli.mcp.startup.wait.seconds` 可调），超时后保留未完成 server 为 `STARTING` 并后台继续初始化；`/mcp` 查看最新状态。
+- 启动期 MCP 不得阻塞首屏：CLI 默认最多等待 8 秒（`PAICLI_MCP_STARTUP_WAIT_SECONDS` / `-Dsharkcli.mcp.startup.wait.seconds` 可调），超时后保留未完成 server 为 `STARTING` 并后台继续初始化；`/mcp` 查看最新状态。
 - `LineReader` 使用 `PaiCliHighlighter` 做输入实时高亮：slash 命令、`@` 引用、`@image:`、`@clipboard`、敏感词和明显危险 shell 片段会在编辑阶段被标记；不要把这类视觉提示混入最终提交文本。
 - `LineReader` 使用 `PaiCliCompleter` 做上下文补全：`/model` provider、`/mcp` 子命令与 server、`/skill` 子命令与 skill name、`/task` / `/browser` / `/snapshot` 子命令、`@image:` 本地路径、本地 `@path` 和 MCP resource `@server:uri` 引用都应从同一个 completer 出口维护。
 - 普通用户输入进入 Agent 前会先展开 MCP resource mention，再由 `LocalPathMentionExpander` 展开本地 `@path`：文件会内联为 `<file>` 块，目录会内联为 `<directory>` 列表；绝对路径或符号链接逃逸项目根时保持原文不展开。
-- `LineReader` 使用 `PaiCliHistory` 持久化输入历史到 `~/.paicli/history/input.history`；如果 `paicli.history.file` / `PAICLI_HISTORY_FILE` 指向目录，也会自动使用该目录下的 `input.history`，避免把目录当文件读；默认忽略空白、重复、明显密钥/Bearer、base64 图片和超长输入，用户可用 `/history clear` 清空本机输入历史。
+- `LineReader` 使用 `PaiCliHistory` 持久化输入历史到 `~/.sharkcli/history/input.history`；如果 `sharkcli.history.file` / `PAICLI_HISTORY_FILE` 指向目录，也会自动使用该目录下的 `input.history`，避免把目录当文件读；默认忽略空白、重复、明显密钥/Bearer、base64 图片和超长输入，用户可用 `/history clear` 清空本机输入历史。
 - JLine 交互升级计划记录在 `docs/phase-22-jline-interaction-upgrade.md`。
 
 ## 关键行为约束（Agent 必读）

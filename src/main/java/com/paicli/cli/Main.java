@@ -84,17 +84,7 @@ import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 
-/**
- * PaiCLI v16.1.0 - Terminal-First Agent IDE
- * 支持 ReAct、Plan-and-Execute、Memory、RAG、Multi-Agent、HITL、并行工具调用、多模型切换、MCP、CDP 会话复用
- * 第 15 期新增：Skill 系统（三层加载 + load_skill 工具 + SkillContextBuffer 注入）、内置 web-access skill
- * 第 16 期新增：TUI 界面（Lanterna 3）、文件树浏览、代码高亮、对话历史可视化、配置管理面板
- * 第 16.1 期形态修正：抽出 Renderer 接口 + 三个实现（inline/lanterna/plain），默认形态切换为 inline 流式 TUI（Claude Code 风格）
- *   - inline 流式：prompt 下方 inline 状态区、行内可折叠工具块、行内 git diff、单字符 HITL 提示、命令 palette
- *   - lanterna：保留 phase-16 全屏窗口（向后兼容 PAICLI_TUI=true）
- *   - plain：纯 println 兜底
- * HITL 增强：路径围栏（PathGuard）、命令快速拒绝（CommandGuard）、操作审计链（AuditLog）—— 见 com.paicli.policy
- */
+/** PaiCLI π v16.1.0 - Java Agent CLI (ReAct / Plan / Multi-Agent / Memory / RAG / MCP / HITL) */
 public class Main {
     private static final String VERSION = "16.1.0";
     private static final String ENV_FILE = ".env";
@@ -131,7 +121,7 @@ public class Main {
         CONTROL_SEQUENCE,
         OTHER
     }
-
+    //四个数据容器，Java方法只能返回一个值，想让方法同时返回文本和取消标志，可以使用record
     private record PromptInput(String text, boolean canceled) {
         static PromptInput submitted(String text) {
             return new PromptInput(text, false);
@@ -183,12 +173,7 @@ public class Main {
     }
 
     public static void main(String[] args) {
-        // ╔══════════════════════════════════════════════════════════════════╗
-        // ║ 第一阶段：前置检查与环境配置                                      ║
-        // ║ - macOS 下禁用 AWT GUI 弹窗（CLI 不需要图形界面）                   ║
-        // ║ - 如果是 `java -jar paicli.jar serve --http` 模式，直接启动         ║
-        // ║   HTTP API Server 然后阻塞，不进入交互式 CLI                       ║
-        // ╚══════════════════════════════════════════════════════════════════╝
+        // --- Phase 1: 前置检查 --- 禁用macOS AWT弹窗；检测serve模式启动HTTP API
         configureAwtForCli();
         if (isRuntimeServeCommand(args)) {
             configureLogging();
@@ -198,12 +183,7 @@ public class Main {
 
         configureLogging();
 
-        // ╔══════════════════════════════════════════════════════════════════╗
-        // ║ 第二阶段：加载配置 & 创建 LLM 客户端                               ║
-        // ║ - PaiCliConfig 从 ~/.paicli/config.json + .env 读取配置           ║
-        // ║ - LlmClientFactory 根据配置的 provider 创建对应的 API 客户端        ║
-        // ║   (GLM / DeepSeek / Step / Kimi)，找不到 key 则退出               ║
-        // ╚══════════════════════════════════════════════════════════════════╝
+        // --- Phase 2: 加载配置 & 创建 LLM 客户端 --- PaiCliConfig 从 ~/.paicli/config.json + .env 读取
         PaiCliConfig config = PaiCliConfig.load();
         LlmClient llmClient = LlmClientFactory.createFromConfig(config);
         if (llmClient == null) {
@@ -211,47 +191,23 @@ public class Main {
             System.err.println("请在 .env 文件中添加 GLM_API_KEY、DEEPSEEK_API_KEY、STEP_API_KEY 或 KIMI_API_KEY");
             System.exit(1);
         }
-       // AtomicReference 包装 llmClient，支持运行时 /model 命令热切换模型
-        // 为什么使用AtomicReference：保证线程安全，因为可能会出现使用/model切换模型时，后台任务还在使用旧的llmClient
+        // AtomicReference 保证热切换llmClient线程安全（/model 切换时后台任务可能还在用旧的）
         AtomicReference<LlmClient> llmClientRef = new AtomicReference<>(llmClient);
 
-        // ╔══════════════════════════════════════════════════════════════════╗
-        // ║ 第三阶段：构建核心组件（"穷人版 IoC" —— 手动 new + 手动注入）         ║
-        // ║                                                                ║
-        // ║ 对象构建顺序（依赖关系决定）：                                      ║
-        // ║   Terminal → HitlHandler → HitlToolRegistry → McpServerManager  ║
-        // ║   → LineReader → Renderer → Agent                              ║
-        // ║                                                                ║
-        // ║ 【HITL = Human-In-The-Loop（人工审批）】                           ║
-        // ║   危险操作（写文件、执行命令）执行前会先问用户"确认执行？"              ║
-        // ║   SwitchableHitlHandler 可通过 /hitl on|off 动态开关              ║
-        // ║                                                                ║
-        // ║ 【HitlToolRegistry 是带审批的 ToolRegistry】                      ║
-        // ║   它继承 ToolRegistry，在执行工具前先走 HITL 审批流程               ║
-        // ╚══════════════════════════════════════════════════════════════════╝
+        // --- Phase 3: 构建核心组件（手动DI）--- Terminal→Hitl→ToolRegistry→MCP→LineReader→Renderer→Agent
         try (Terminal terminal = TerminalBuilder.builder()
                 .system(true)
                 .dumb(true)
                 .build()) {
-            // --- HITL（人工审批）子系统初始化 ---
-            // TerminalHitlHandler: 终端模式下的人工审批处理
             TerminalHitlHandler terminalHitlHandler = new TerminalHitlHandler(false);
-            // SwitchableHitlHandler: 可切换的 HITL 处理器
             SwitchableHitlHandler hitlHandler = new SwitchableHitlHandler(terminalHitlHandler);
-            // HitlToolRegistry: 带审批的 ToolRegistry
             HitlToolRegistry hitlToolRegistry = new HitlToolRegistry(hitlHandler);
 
 
-            // --- 浏览器子系统初始化 ---
-            // BrowserSession: 管理浏览器连接状态（isolated/shared 两种模式）
             BrowserSession browserSession = new BrowserSession();
-            // BrowserConnectivityCheck: 检查浏览器是否可访问
             BrowserConnectivityCheck browserConnectivityCheck = new BrowserConnectivityCheck();
-            // BrowserGuard: 拦截敏感页面操作（如自动阻止访问银行网站）
             hitlToolRegistry.setBrowserGuard(new BrowserGuard(browserSession, new SensitivePagePolicy()));
 
-            // --- MCP（Model Context Protocol）子系统初始化 ---
-            // MCP 让 PaiCLI 可以连接外部工具服务器（如 chrome-devtools），动态获得新工具
             McpServerManager mcpServerManager = new McpServerManager(hitlToolRegistry, Path.of("."));
             AtomicReference<SkillRegistry> skillRegistryRef = new AtomicReference<>();
             hitlToolRegistry.setBrowserConnector(new com.paicli.browser.BrowserConnector() {
@@ -274,41 +230,21 @@ public class Main {
                 }
             });
 
-            // ╔══════════════════════════════════════════════════════════════════╗
-            // ║ 第四阶段：构建 JLine 终端交互层                                    ║
-            // ║ JLine 4 是 Java 最强终端交互库，提供：                             ║
-            // ║   - 行编辑（光标移动、删除、粘贴）                                 ║
-            // ║   - Tab 补全（命令、路径、MCP resource）                           ║
-            // ║   - 语法高亮（/命令、@引用、敏感词标红）                            ║
-            // ║   - 历史记录（↑↓ 翻找、持久化到文件）                              ║
-            // ║   - Bracketed Paste（大段粘贴不会触发逐字处理）                    ║
-            // ╚══════════════════════════════════════════════════════════════════╝
-
-            // 创建 LineReader，这是JLine的核心组件
-            //负责读取用户输入、行编辑、Tab 补全、语法高亮、历史记录等
+            // --- Phase 4: JLine 终端交互（行编辑/Tab补全/语法高亮/历史）---
             LineReader lineReader = LineReaderBuilder.builder()
                     .terminal(terminal)
-                    .history(new PaiCliHistory())  // 自定义历史：过滤敏感输入（API Key/base64 图片等）
+                    .history(new PaiCliHistory())  // 过滤敏感输入（API Key/base64 等）
                     .completer(new PaiCliCompleter(mcpServerManager::resourceCandidates,
                             () -> skillRegistryRef.get() == null ? List.of() : skillRegistryRef.get().allSkills()))
-                    .highlighter(new PaiCliHighlighter())  // 输入实时高亮
+                    .highlighter(new PaiCliHighlighter())
                     .build();
-            // 配置 LineReader 选项
-            lineReader.option(LineReader.Option.BRACKETED_PASTE, true);  // 支持整块粘贴
-            lineReader.option(LineReader.Option.AUTO_LIST, true);        // Tab 自动列出候选
-            lineReader.option(LineReader.Option.AUTO_MENU, true);        // Tab 自动弹出菜单
-            configureHistory(lineReader, Path.of(System.getProperty("user.home")));  // 持久化历史到 ~/.paicli/history/
-            configureSlashCommandHint(lineReader);       // 输入 / 时触发命令提示
-            configureJLineInteractiveWidgets(lineReader); // 启用自动建议 + 自动配对括号
+            lineReader.option(LineReader.Option.BRACKETED_PASTE, true);
+            lineReader.option(LineReader.Option.AUTO_LIST, true);
+            lineReader.option(LineReader.Option.AUTO_MENU, true);
+            configureHistory(lineReader, Path.of(System.getProperty("user.home")));
+            configureSlashCommandHint(lineReader);
 
-            // ╔══════════════════════════════════════════════════════════════════╗
-            // ║ 第五阶段：构建渲染层                                               ║
-            // ║ Renderer 是统一输出通道，所有可见文字都通过它输出：                   ║
-            // ║   - InlineRenderer: 默认模式，Claude Code 风格的流式输出            ║
-            // ║   - LanternaRenderer: 全屏 TUI 模式（旧版）                       ║
-            // ║   - PlainRenderer: 纯 println 兜底                              ║
-            // ║ 所有输出走 renderer.stream() = PrintStream ui，不直接用 System.out  ║
-            // ╚══════════════════════════════════════════════════════════════════╝
+            // --- Phase 5: 渲染层（InlineRenderer / Lanterna / Plain 三种实现）---
             Renderer renderer = RendererFactory.create(RendererFactory.resolveMode(), terminal);
             RendererHitlHandler rendererHitl = new RendererHitlHandler(renderer, hitlHandler.isEnabled());
             hitlHandler.setDelegate(rendererHitl);  // HITL 审批弹窗也走 renderer 输出
@@ -322,36 +258,23 @@ public class Main {
             // --- MCP Server 启动（最多等 8 秒，超时后后台继续） ---
             String startupNote = "";
             try {
-                // 确保 ~/.paicli/mcp.json 存在，首次运行自动创建默认配置
                 McpConfigBootstrapResult bootstrapResult = ensureDefaultMcpConfig(Path.of(System.getProperty("user.home")));
                 if (!bootstrapResult.message().isBlank()) {
                     startupNote = bootstrapResult.message();
                 }
-                mcpServerManager.loadConfiguredServers();  // 从 mcp.json 读取 server 列表
-                mcpServerManager.startAll(ui, mcpStartupWait());  // 启动所有 MCP server（并行）
+                mcpServerManager.loadConfiguredServers();
+                mcpServerManager.startAll(ui, mcpStartupWait());
                 Runtime.getRuntime().addShutdownHook(new Thread(mcpServerManager::close, "paicli-mcp-shutdown"));
             } catch (Exception e) {
                 startupNote = "MCP 初始化失败: " + e.getMessage();
             }
-            // @mention 展开器：用户输入 @server:uri 时，自动拉取 MCP resource 内容注入 prompt
             AtMentionExpander mentionExpander = new AtMentionExpander(mcpServerManager);
-            // @path 展开器：用户输入 @src/Main.java 时，自动读取文件内容注入 prompt
             LocalPathMentionExpander localPathMentionExpander = new LocalPathMentionExpander(Path.of("."));
 
-            // ╔══════════════════════════════════════════════════════════════════╗
-            // ║ 第六阶段：Skill 系统初始化                                         ║
-            // ║ Skill = 预定义的 Markdown 指令包，教 Agent 如何完成特定任务          ║
-            // ║ 三层目录优先级：内置 > 项目级 > 用户级                              ║
-            // ║   ~/.paicli/skills-cache/ ← 内置 skill 解压到这里                 ║
-            // ║   ~/.paicli/skills/       ← 用户全局自定义 skill                  ║
-            // ║   .paicli/skills/          ← 项目级 skill                        ║
-            // ╚══════════════════════════════════════════════════════════════════╝
-
-            // 定义三层 skill 目录
-            // 定义三层 skill 目录结构
+            // --- Phase 6: Skill 系统（内置MD指令包，三层目录：内置>项目级>用户级）---
             Path home = Path.of(System.getProperty("user.home"));
-            Path skillsCacheDir = home.resolve(".paicli/skills-cache");  // 内置 skill 解压目录
-            Path userSkillsDir = home.resolve(".paicli/skills");         // 用户全局 skill 目录
+            Path skillsCacheDir = home.resolve(".paicli/skills-cache");
+            Path userSkillsDir = home.resolve(".paicli/skills");
             Path projectSkillsDir = Path.of(".paicli/skills").toAbsolutePath();
             try {
                 new com.paicli.skill.SkillBuiltinExtractor(skillsCacheDir).extractAll();
@@ -363,34 +286,20 @@ public class Main {
                     skillsCacheDir, userSkillsDir, projectSkillsDir, skillStateStore);
            // 加载 skill 列表（内置 + 用户全局 + 项目级）
             skillRegistry.reload();
-            // 保存到AtomicReference
             skillRegistryRef.set(skillRegistry);
 
             com.paicli.skill.SkillContextBuffer skillContextBuffer = new com.paicli.skill.SkillContextBuffer();
 
-            // 注册skill到hitlToolRegistry（带人工审核的tool），使Agent可以调用skill
             hitlToolRegistry.setSkillRegistry(skillRegistry);
             hitlToolRegistry.setSkillContextBuffer(skillContextBuffer);
 
-            // ╔══════════════════════════════════════════════════════════════════╗
-            // ║ 第七阶段：创建 Agent（核心 AI 执行引擎）                             ║
-            // ║                                                                ║
-            // ║ Agent 是 ReAct 循环的执行者：                                     ║
-            // ║   1. 接收用户输入                                                ║
-            // ║   2. 调用 LLM 生成回答或工具调用                                   ║
-            // ║   3. 执行工具 → 把结果反馈给 LLM → 重复直到 LLM 给出最终回答        ║
-            // ║                                                                ║
-            // ║ DurableTaskManager: 后台持久任务管理（/task add 提交的异步任务）     ║
-            // ╚══════════════════════════════════════════════════════════════════╝
-
-            // 创建 Agent
+            // --- Phase 7: Agent（ReAct循环引擎）+ 后台任务管理器 ---
             Agent reactAgent = new Agent(llmClient, hitlToolRegistry);
-            // 配置外部上下文提供器：MCP resource 索引注入 system prompt
-            reactAgent.setExternalContextSupplier(mcpServerManager::resourceIndexForPrompt);  // MCP resource 索引注入 system prompt
+            reactAgent.setExternalContextSupplier(mcpServerManager::resourceIndexForPrompt);
 
-            reactAgent.setSkillRegistry(skillRegistry);      // Skill 列表注入 system prompt
-            reactAgent.setSkillContextBuffer(skillContextBuffer);  // 已加载 skill 的内容缓冲
-            DurableTaskManager taskManager = openTaskManager(llmClientRef);  // 后台任务管理器
+            reactAgent.setSkillRegistry(skillRegistry);
+            reactAgent.setSkillContextBuffer(skillContextBuffer);
+            DurableTaskManager taskManager = openTaskManager(llmClientRef);
             taskManager.start();
             Runtime.getRuntime().addShutdownHook(new Thread(taskManager::close, "paicli-task-shutdown"));
 
@@ -403,15 +312,11 @@ public class Main {
                 printStartupScreen(ui, startupScreenInfo);
             }
 
-            // 两个标志位：控制下一条输入用哪种执行模式
-            boolean nextTaskUsePlanMode = false;   // /plan 命令设置
-            boolean nextTaskUseTeamMode = false;   // /team 命令设置
+            // /plan /team 模式标志位（单次有效，执行后重置）
+            boolean nextTaskUsePlanMode = false;
+            boolean nextTaskUseTeamMode = false;
 
-            // ╔══════════════════════════════════════════════════════════════════╗
-            // ║ TUI / CLI 分支判断                                             ║
-            // ║ 如果环境变量 PAICLI_TUI=true，走全屏 TUI 模式（Lanterna）           ║
-            // ║ 否则走默认的 inline CLI 模式（下方主循环）                        ║
-            // ╚══════════════════════════════════════════════════════════════════╝
+            // --- TUI分支判断（PAICLI_TUI=true时走lanterna全屏模式） ---
             if (com.paicli.tui.TuiBootstrap.shouldUseTui(terminal)) {
                 try {
                     com.paicli.tui.TuiBootstrap.launch(config, llmClient, reactAgent, hitlHandler);
@@ -426,14 +331,10 @@ public class Main {
 
             reactAgent.setRenderer(renderer);
             reactAgent.setHitlEnabledSupplier(hitlHandler::isEnabled);
-            // 文件写入时通知 renderer 显示 diff 对比
             reactAgent.getToolRegistry().setWriteFileObserver(
                     (path, ba) -> renderer.appendDiff(path, ba[0], ba[1]));
 
-            // --- 快捷键绑定 ---
-            // Ctrl+O: 展开/收起折叠块（工具调用结果、diff 等）
-            // Ctrl+V: 从系统剪贴板读图片并插入 @image:<path>
-            // ESC:    清空当前输入行
+            // --- 快捷键绑定：Ctrl+O（折叠块）/ Ctrl+V（粘贴图片）/ ESC（清空输入） ---
             boolean spaciousPrompt = false;
             if (renderer instanceof InlineRenderer inline) {
                 bindCtrlOToFoldableBlocks(lineReader, inline);
@@ -442,22 +343,7 @@ public class Main {
             bindCtrlVToClipboardImage(lineReader);
             bindEscToClearInput(lineReader);
 
-            // ╔══════════════════════════════════════════════════════════════════╗
-            // ║ 第八阶段：REPL 主循环（Read-Eval-Print Loop）                     ║
-            // ║                                                                ║
-            // ║ 整体流程：                                                      ║
-            // ║   1. 读取用户输入（readPromptInput）                                ║
-            // ║   2. 解析命令（CliCommandParser.parse）                             ║
-            // ║      → /命令：直接处理并 continue                               ║
-            // ║      → 普通文本：展开 @mention → 选择执行模式 → 调用 Agent     ║
-            // ║   3. 显示 Agent 返回结果                                       ║
-            // ║   4. 回到步骤 1                                                ║
-            // ║                                                                ║
-            // ║ 三种执行模式：                                                  ║
-            // ║   - ReAct（默认）：思考-行动-观察 循环                             ║
-            // ║   - Plan-and-Execute（/plan）：先规划 DAG 再执行                    ║
-            // ║   - Multi-Agent（/team）：多 Agent 协作（规划者+执行者+检查者）    ║
-            // ╚══════════════════════════════════════════════════════════════════╝
+            // --- Phase 8: REPL 主循环（Read / ParseCommand / Execute Agent / Loop） ---
             while (true) {
                 PromptInput promptInput;
                 try {
@@ -784,28 +670,16 @@ public class Main {
                     }
                 }
 
-                // ╔══════════════════════════════════════════════════════════════════╗
-                // ║ 命令解析完毕、没走 continue → 进入 Agent 执行流程                ║
-                // ║                                                                ║
-                // ║ 流程：                                                          ║
-                // ║ 1. 展开 @server:uri → 拉取 MCP resource 内容                     ║
-                // ║ 2. 展开 @path → 读取本地文件/目录内容                           ║
-                // ║ 3. 根据模式选择创建对应 Agent：                                   ║
-                // ║    - ReAct: reactAgent.run(input)                             ║
-                // ║    - Plan: PlanExecuteAgent 规划→审阅→执行                      ║
-                // ║    - Team: AgentOrchestrator 多角色协作                       ║
-                // ║ 4. snapshotService.runTurn() 包裹执行，自动创建 Side-Git 快照    ║
-                // ║ 5. runWithCancelSupport() 支持任务运行中按 ESC 取消             ║
-                // ╚══════════════════════════════════════════════════════════════════╝
+                // --- @mention / @path 展开 → 执行 Agent ---
                 String submittedInput = input;
-                input = mentionExpander.expand(input);       // 展开 @server:uri
-                input = localPathMentionExpander.expand(input);  // 展开 @path
+                input = mentionExpander.expand(input);
+                input = localPathMentionExpander.expand(input);
                 if (!(renderer instanceof InlineRenderer)) {
                     ui.println();
                 }
                 renderer.beginTurn();
                 if (renderer instanceof InlineRenderer inline) {
-                    inline.printSubmittedPrompt(submittedInput);  // 回显用户输入（暗色块）
+                    inline.printSubmittedPrompt(submittedInput);
                 } else {
                     printSubmittedPrompt(ui, submittedInput);
                 }
@@ -813,9 +687,8 @@ public class Main {
                 Callable<String> runTask;
                 String snapshotMode;
 
-                // --- 根据模式选择创建不同的执行体 ---
+                // --- 根据模式选择执行体：ReAct / Plan-and-Execute / Multi-Agent ---
                 if (nextTaskUsePlanMode || command.type() == CliCommandParser.CommandType.SWITCH_PLAN) {
-                    // Plan-and-Execute 模式：先生成执行计划（DAG），用户审阅后按计划执行
                     snapshotMode = "plan";
                     LlmClient activeClient = llmClient;
                     runTask = () -> {
@@ -826,7 +699,6 @@ public class Main {
                         return planAgent.run(taskInput);
                     };
                 } else if (nextTaskUseTeamMode || command.type() == CliCommandParser.CommandType.SWITCH_TEAM) {
-                    // Multi-Agent 模式：多个专业 Agent 协作（规划者 + 执行者 + 检查者）
                     snapshotMode = "team";
                     LlmClient activeClient = llmClient;
                     runTask = () -> {
@@ -836,16 +708,12 @@ public class Main {
                         return orchestrator.run(taskInput);
                     };
                 } else {
-                    // 默认 ReAct 模式：思考→行动→观察，循环直到给出最终回答
                     snapshotMode = "react";
                     runTask = () -> reactAgent.run(taskInput);
                 }
 
                 // --- 执行任务（带取消支持 + Side-Git 快照保护） ---
                 SnapshotService snapshotService = reactAgent.getToolRegistry().getSnapshotService();
-                renderer.updateStatus(statusInfo(llmClient, hitlHandler, snapshotMode, mcpServerManager, skillRegistry));
-                // runWithCancelSupport: 任务运行时监听 ESC，按下则取消
-                // snapshotService.runTurn: 执行前自动创建 pre-turn 快照，执行后创建 post-turn 快照
                 String response = runWithCancelSupport(terminal,
                         ui,
                         () -> snapshotService.runTurn(snapshotMode, taskInput, runTask::call));
@@ -868,20 +736,7 @@ public class Main {
         }
     }
 
-    // ╔══════════════════════════════════════════════════════════════════════════════╗
-    // ║ 以下是辅助方法区                                                            ║
-    // ║                                                                            ║
-    // ║ 按职责分为几组：                                                            ║
-    // ║   1. Runtime API 启动（serve --http 模式的无头运行）                         ║
-    // ║   2. Agent 工厂方法（createPlanAgent / createTeamAgent）                    ║
-    // ║   3. 任务取消支持（runWithCancelSupport / readEscCancel）                   ║
-    // ║   4. 输入处理（readPromptInput / readPrefillInputFromTerminal）             ║
-    // ║   5. ESC 序列识别（classifyEscapeSequence / readInputBurst）                ║
-    // ║   6. 快捷键绑定（bindCtrlO / bindCtrlV / bindEsc）                          ║
-    // ║   7. /命令处理（handleBrowserCommand / handleConfigPalette / printXxx）     ║
-    // ║   8. 配置加载（loadConfigValue / configureLogging / configureHistory）      ║
-    // ║   9. 启动屏幕渲染（startupBannerLines / startupScreenLines）               ║
-    // ╚══════════════════════════════════════════════════════════════════════════════╝
+    // --- 辅助方法：Runtime API / Agent工厂 / 取消支持 / 输入处理 / 快捷键 / 命令处理 / 配置加载 / 启动屏幕 ---
 
     /**
      * 判断命令行参数是否为 "serve --http" —— Runtime API 模式
@@ -894,10 +749,7 @@ public class Main {
                 && java.util.Arrays.stream(args).anyMatch("--http"::equalsIgnoreCase);
     }
 
-    /**
-     * 启动 Runtime API Server 并阻塞（供 CI/CD、Web 后端等场景无头调用 Agent）
-     * 启动后监听 HTTP 请求，调用 Agent 执行任务并返回结果
-     */
+    /** 启动 Runtime API Server 并阻塞（供无头调用，-Dpaicli.runtime.api.key 鉴权） */
     private static void startRuntimeApiAndBlock(String[] args) {
         PaiCliConfig config = PaiCliConfig.load();
         LlmClient client = LlmClientFactory.createFromConfig(config);
@@ -945,10 +797,7 @@ public class Main {
         return defaultPort;
     }
 
-    /**
-     * 无头（headless）模式执行单个任务 —— 不走交互 CLI，直接运行 Agent 并返回结果
-     * 用于 Runtime API 和后台任务
-     */
+    /** 无头模式执行单个任务（不走交互 CLI，直接运行 Agent），用于 Runtime API 和后台任务 */
     private static String runHeadlessTask(String prompt, LlmClient llmClient) {
         ToolRegistry registry = new ToolRegistry();
         registry.setProjectPath(Path.of(".").toAbsolutePath().normalize().toString());
@@ -993,16 +842,8 @@ public class Main {
     }
 
     /**
-     * 带取消支持的任务执行器
-     *
-     * 【工作原理】
-     * 1. 用单线程 ExecutorService 启动任务
-     * 2. 终端切到 raw mode，每 150ms 检查一次是否有 ESC 按下
-     * 3. 如果检测到 ESC → 取消任务 + 中断线程
-     * 4. 任务完成 → 恢复终端属性 → 返回结果
-     *
-     * 【为什么需要 raw mode】
-     * 正常模式下终端会等 Enter 才给程序输入，raw mode 下每个按键立即可读
+     * 带取消支持的任务执行器：启动任务 → raw mode 监听ESC → 取消或返回结果
+     * raw mode 关 ICANON/ECHO/IEXTEN 但保留 ISIG，Ctrl+C 仍能终止 PaiCLI
      */
     private static String runWithCancelSupport(Terminal terminal, PrintStream out, Callable<String> task) {
         CancellationToken token = CancellationContext.startRun();
@@ -1095,10 +936,10 @@ public class Main {
     }
 
     /**
-     * ESC 取消判断的纯函数版（不依赖终端 IO，便于单测）。
+     * ESC 取消判断的纯函数版（不依赖终端 IO，便于单测）
      *
      * @param firstByte ESC=27 触发判断；其他字节直接返回 false
-     * @param escTail  紧跟 ESC 之后的字节序列（不含 ESC 本身）；null / 空 → 单 ESC 取消
+     * @param escTail   紧跟 ESC 之后的字节序列；null/空 → 单 ESC 取消
      */
     static boolean decideEscCancel(int firstByte, String escTail) {
         if (firstByte != 27) {
@@ -1485,9 +1326,7 @@ public class Main {
         }
         new AutosuggestionWidgets(lineReader).enable();
         new AutopairWidgets(lineReader).enable();
-        // JLine TailTipWidgets 会通过 Status 预留多行底部区域；如果在首屏前 enable，
-        // banner 前会出现大段空白，输入行下方也会长期空出一块。命令说明后续用
-        // 不预留布局的方式展示，避免破坏 Claude Code / Qoder 风格的 inline 体验。
+        // TailTipWidgets 会在 Status 预留底部区域，首屏前 enable 会导致 banner 前出现空白
     }
 
     static LinkedHashMap<String, CmdDesc> slashCommandTailTips() {
@@ -1589,13 +1428,8 @@ public class Main {
         }
     }
 
-    // Ctrl+V 抓系统剪贴板里的图片到 ~/.paicli/cache/ 并把 @image:<path> 注入当前输入行。
-    // 失败（无图 / headless / IO 错误）时只打提示，不破坏现有 buffer，覆盖掉 JLine 默认的
-    // quoted-insert 没有交互价值。注意 macOS Cmd+V 通常被终端劫持成本地粘贴文本，所以这里
-    // 绑的是 Ctrl+V（ASCII 22 / SYN），iTerm / Terminal.app 默认不会拦截。
-    //
-    // 输入层不按模型名拦截图片：与 Claude Code 类似，先把图片读成附件收进
-    // prompt；模型是否接受 image block 由 provider API 自己处理。
+    // Ctrl+V 抓系统剪贴板图片 → ~/.paicli/cache/ → 注入 @image:<path>
+    // 使用 ASCII 22 (SYN)，避免与 macOS Cmd+V 终端粘贴冲突
     static void bindCtrlVToClipboardImage(LineReader lineReader) {
         if (lineReader == null) {
             return;
@@ -2088,7 +1922,7 @@ public class Main {
             lineReader.setOpt(LineReader.Option.DISABLE_EVENT_EXPANSION);
             lineReader.getHistory().load();
         } catch (IOException ignored) {
-            // History is a convenience feature; failed persistence must not block the CLI.
+            // 历史持久化失败不阻塞CLI
         }
     }
 
@@ -2209,10 +2043,7 @@ public class Main {
     }
 
     /**
-     * 加载配置值的优先级链（高 → 低）：
-     *   System.getProperty → System.getenv → 当前目录 .env → 用户 home/.env → defaultValue
-     *
-     * 这就是为什么你只需要在 .env 文件里写 API Key 就能用的原因
+     * 加载配置值的优先级链：System.getProperty → System.getenv → .env → defaultValue
      */
     private static String loadConfigValue(String key, String defaultValue) {
         String sysValue = System.getProperty(key);
@@ -2262,11 +2093,7 @@ public class Main {
         return null;
     }
 
-    /**
-     * 解析 /model 命令参数，返回目标 provider 和模型名
-     * 例如："glm-5.1" → provider=glm, model=glm-5.1, explicitModel=true
-     *       "deepseek"  → provider=deepseek, model=null, explicitModel=false（用配置里的默认模型）
-     */
+    /** 解析 /model 命令参数："glm-5.1" → glm/glm-5.1（显式模型），"deepseek" → deepseek/null（读配置） */
     static ModelSelection resolveModelSelection(String raw) {
         String value = raw == null ? "" : raw.trim();
         String normalized = value.toLowerCase(Locale.ROOT);
@@ -2324,9 +2151,7 @@ public class Main {
                 ""));
     }
 
-    /**
-     * 构建启动 Banner 的文字内容（π 主题 logo + 模型/MCP/Skill 信息 + tips）
-     */
+    /** π 主题 logo + 模型/MCP/Skill 信息 + tips */
     static List<String> startupBannerLines(StartupScreenInfo info) {
         String model = info.model() == null || info.model().isBlank() ? "auto" : info.model();
         String provider = info.provider() == null || info.provider().isBlank() ? "model" : info.provider();
@@ -2358,10 +2183,7 @@ public class Main {
         return lines;
     }
 
-    /**
-     * 首次启动时确保 ~/.paicli/mcp.json 存在
-     * 如果不存在，自动创建默认配置（chrome-devtools isolated 模式）
-     */
+    /** 首次启动时确保 ~/.paicli/mcp.json 存在，否则创建默认 chrome-devtools 配置 */
     static McpConfigBootstrapResult ensureDefaultMcpConfig(Path userHome) throws IOException {
         Path configFile = userHome.resolve(".paicli").resolve("mcp.json");
         if (Files.notExists(configFile)) {
