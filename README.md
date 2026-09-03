@@ -1,4 +1,4 @@
-# sharkCli
+# sharkCLI
 
 一个成熟的 Java Agent CLI 产品，对标 Claude Code 
 
@@ -81,7 +81,7 @@ mvn test -DskipTests=false
 - `LlmClient` 接口抽象 + `AbstractOpenAiCompatibleClient` 模板基类
 - 内置 `GLMClient`、`DeepSeekClient`、`StepClient`、`KimiClient` 四个瘦实现
 - `/model glm-5.1` / `/model glm-5v-turbo` 明确切 GLM 模型；`/model deepseek` / `/model step` / `/model kimi` 切 provider 并读取配置里的具体模型
-- 配置持久化到 `~/.sharkcli/config.json`，API Key 可从配置、环境变量或 `.env` 读取
+- 配置持久化到 `~/.paicli/config.json`，API Key 可从配置、环境变量或 `.env` 读取
 
 ### 第九期：联网能力 + Web 工具
 
@@ -92,8 +92,8 @@ mvn test -DskipTests=false
 
 ### 第十期：MCP 协议核心
 
-- 新增 `com.sharkcli.mcp` 模块，支持 stdio 子进程 server 与 Streamable HTTP 远程 server
-- 启动时读取 `~/.sharkcli/mcp.json` 与 `.sharkcli/mcp.json`，项目级配置按 server 名覆盖用户级配置
+- 新增 `com.paicli.mcp` 模块，支持 stdio 子进程 server 与 Streamable HTTP 远程 server
+- 启动时读取 `~/.paicli/mcp.json` 与 `.paicli/mcp.json`，项目级配置按 server 名覆盖用户级配置
 - MCP 工具自动注册为 `mcp__{server}__{tool}`，参数 schema 会清洗 `$ref` / `anyOf` / 超长 description，降低模型调用失败率
 - 所有 MCP 工具默认走 HITL 审批和审计，审计参数会脱敏 token / key / password / Authorization / Bearer 凭证
 - 支持 MCP resources：server 声明 `resources` capability 后，自动注册 `mcp__{server}__list_resources` / `mcp__{server}__read_resource` 虚拟工具
@@ -101,7 +101,7 @@ mvn test -DskipTests=false
 - 被动处理 `notifications/tools/list_changed`、`notifications/resources/list_changed`、`notifications/resources/updated`
 - 运行中输入 `/cancel` 并回车可请求取消当前 Agent run
 - CLI 命令：`/mcp`、`/mcp restart <name>`、`/mcp logs <name>`、`/mcp disable <name>`、`/mcp enable <name>`、`/mcp resources <name>`、`/mcp prompts <name>`
-- `~/.sharkcli/mcp.json` 不存在时会自动创建默认 chrome-devtools 配置；项目级 `.sharkcli/mcp.json` 仍可按 server 名覆盖
+- `~/.paicli/mcp.json` 不存在时会自动创建默认 chrome-devtools 配置；项目级 `.paicli/mcp.json` 仍可按 server 名覆盖
 
 ### 第十二期：长上下文工程
 
@@ -117,7 +117,7 @@ mvn test -DskipTests=false
 ### 第十三期：Chrome DevTools MCP
 
 - 默认接入 Google 官方 `chrome-devtools-mcp@latest`，注册为 `mcp__chrome-devtools__navigate_page`、`take_snapshot`、`click`、`fill_form` 等浏览器工具
-- `~/.sharkcli/mcp.json` 不存在时启动自动创建模板，默认使用 `--isolated=true` 临时浏览器 profile
+- `~/.paicli/mcp.json` 不存在时启动自动创建模板，默认使用 `--isolated=true` 临时浏览器 profile
 - 用于处理 SPA / JS 渲染 / 防爬墙 / 表单交互页面；微信公众号文章、知乎专栏、推特、小红书等 `web_fetch` 失败站点会引导走浏览器 MCP
 - HITL 的“全部放行”支持 MCP server 维度，连续浏览器操作可对 `chrome-devtools` 一次确认
 - `image` 类型结果会作为图片输入附加到下一轮；文本 fallback 仍保留，用于日志、人类可读摘要和 API 不接受图片时的上下文
@@ -138,13 +138,13 @@ mvn test -DskipTests=false
 
 把"Agent 该怎么思考"从硬编码 system prompt 抽出，沉淀成可复用单元。每个 Skill 是一个目录：`SKILL.md`（决策手册）+ `references/`（按需读取）+ 可选 `scripts/`（可执行依赖）。
 
-- 三层加载位置（按优先级，后者整体覆盖同名 skill）：jar 内置 < 用户级 `~/.sharkcli/skills/<name>/` < 项目级 `<project>/.sharkcli/skills/<name>/`
+- 三层加载位置（按优先级，后者整体覆盖同名 skill）：jar 内置 < 用户级 `~/.paicli/skills/<name>/` < 项目级 `<project>/.paicli/skills/<name>/`
 - 启动期把启用 skill 的 `name` + `description` 注入三处 Agent 系统提示词索引段（启用上限 20 个，索引段 ≤ 4KB）
 - 内置工具 `load_skill(name)`：LLM 在 system prompt 看到匹配 description 时主动调用，PaiCLI 把 SKILL.md 正文（5KB 截断）写入 `SkillContextBuffer`，下一轮 user message 自动前置注入
 - 内置 web-access skill：决策手册（浏览哲学四步法 + 工具选择表 + 浏览器优先级 + Jina 兜底说明）+ 6 个站点经验文件（mp.weixin / zhuanlan.zhihu / x.com / xiaohongshu / github / juejin）+ cdp-cheatsheet
 - frontmatter 走手写 YAML 子集解析，不引 SnakeYAML；解析失败 stderr 警告但不阻塞启动
 - CLI 命令：`/skill list` / `/skill show <name>` / `/skill on <name>` / `/skill off <name>` / `/skill reload`
-- 启用状态持久化：`~/.sharkcli/skills.json` 的 `disabled` 列表，默认全启用
+- 启用状态持久化：`~/.paicli/skills.json` 的 `disabled` 列表，默认全启用
 - 与 HITL 协同：Skill 内调用 `execute_command` 等危险工具仍走既有 HITL 审批，沿用 `execute_command` 工具维度全放行；不给 Skill 单独审批维度
 
 设计意图：从「写工具」演进到「打包专家手册」。当工具堆成山（PaiCLI 当前内置 9 个 + MCP 60+ 工具），用 Skill 给 LLM 一份按场景展开的"专家手册"，比往 system prompt 里塞更多规则更可扩展。
@@ -162,7 +162,7 @@ v16.1 抽出 `Renderer` 接口 + 三个实现：
 - 三种形态共享同一套 `Agent` / `ToolRegistry` / `MemoryManager` / MCP server / SkillRegistry / HITL handler，不创建孤立空会话
 - 普通输入走 ReAct；`/plan <任务>` 走 Plan-and-Execute；`/team <任务>` 走 Multi-Agent；`/cancel` 可取消运行中任务
 - 通用命令：`/clear`、`/context`、`/memory`、`/memory clear`、`/save <事实>`、`/hitl`、`/hitl on`、`/hitl off`、`/config`、`/exit`
-- 对话历史保存到 `~/.sharkcli/history/session_*.jsonl`
+- 对话历史保存到 `~/.paicli/history/session_*.jsonl`
 - 兼容旧设置：`PAICLI_TUI=true` 自动映射为 `PAICLI_RENDERER=lanterna`（已 deprecated）
 - `PAICLI_NO_STATUSBAR=true` 在 inline 模式下禁用 JLine 底部 dock（不适合 ANSI 光标控制的终端）
 - `NO_COLOR=1` 禁用所有 ANSI 颜色，保留布局
@@ -179,7 +179,7 @@ v16.1 抽出 `Renderer` 接口 + 三个实现：
 ### 第十八期：Git Side-History 快照与回滚（MVP）
 
 - 每个 ReAct / Plan / Team turn 开始前创建 `pre-turn` 快照，结束后异步创建 `post-turn` 快照
-- 快照仓库使用 JGit 纯 Java 实现，默认位于 `~/.sharkcli/snapshots/<project_hash>/<worktree_hash>/.git`，不写用户项目 `.git`
+- 快照仓库使用 JGit 纯 Java 实现，默认位于 `~/.paicli/snapshots/<project_hash>/<worktree_hash>/.git`，不写用户项目 `.git`
 - `/snapshot` 查看最近快照，`/snapshot status` 查看配置与 side-git 目录，`/snapshot clean` 清理当前项目快照目录
 - `/restore <N>` 恢复到最近第 N 个 `pre-turn` 快照；恢复前会先创建 `pre-restore` 快照
 - Agent 内置 `revert_turn` 工具，纳入 HITL 与 AuditLog 危险工具链
@@ -189,19 +189,19 @@ v16.1 抽出 `Renderer` 接口 + 三个实现：
 
 - ReAct、Plan task executor、Multi-Agent 三角色、Planner 的 system prompt 已从 Java 硬编码抽离到 `src/main/resources/prompts/`
 - `PromptAssembler` 按 `base -> personality -> mode -> approval -> project_context -> skills -> context_mgmt -> handoff` 组装，动态上下文靠后注入
-- 支持用户级覆盖 `~/.sharkcli/prompts/...`，支持项目级覆盖 `.sharkcli/prompts/...`，项目级优先级最高
+- 支持用户级覆盖 `~/.paicli/prompts/...`，支持项目级覆盖 `.paicli/prompts/...`，项目级优先级最高
 - 覆盖是整文件替换；`base.md` 和最终 prompt 必须包含 `## Language`
 - Prompt 改动审计模板见 `docs/prompt-analysis-template.md`
 
 ### 第二十期：异步后台任务 + Runtime API（MVP）
 
-- `DurableTaskManager` 使用 SQLite 持久化后台任务队列，默认位置 `~/.sharkcli/tasks/tasks.db`
+- `DurableTaskManager` 使用 SQLite 持久化后台任务队列，默认位置 `~/.paicli/tasks/tasks.db`
 - 任务生命周期：`enqueued -> running -> completed / failed / canceled`
 - `/task`、`/task add <任务内容>`、`/task cancel <task_id>`、`/task log <task_id>` 提供 CLI 闭环
 - Worker Pool 默认 2 个后台 worker，可通过 `PAICLI_TASK_WORKERS` 调整
-- `java -jar target/sharkcli-1.0-SNAPSHOT.jar serve --http --port 8080` 启动 localhost Runtime API
+- `java -jar target/paicli-1.0-SNAPSHOT.jar serve --http --port 8080` 启动 localhost Runtime API
 - Runtime API 端点：`POST /v1/threads`、`POST /v1/threads/{id}/turns`、`GET /v1/threads/{id}/events`
-- Runtime API 强制要求 `PAICLI_RUNTIME_API_KEY` 或 `-Dsharkcli.runtime.api.key`
+- Runtime API 强制要求 `PAICLI_RUNTIME_API_KEY` 或 `-Dpaicli.runtime.api.key`
 - 详细文档见 `docs/phase-20-runtime-api.md`
 
 ### 第二十一期：图片复制粘贴输入（MVP）
@@ -219,11 +219,11 @@ v16.1 抽出 `Renderer` 接口 + 三个实现：
 
 ### 第六期 HITL 增强（路径围栏 / 命令快速拒绝 / 操作审计）
 
-`com.sharkcli.policy` 包，作为 HITL 之外的辅助层（不是沙箱、不提供进程隔离）：
+`com.paicli.policy` 包，作为 HITL 之外的辅助层（不是沙箱、不提供进程隔离）：
 
 - `PathGuard` 路径围栏：文件类工具强制限定在项目根之内，拦截绝对路径外逃 / `..` 穿越 / 符号链接逃逸
 - `CommandGuard` 命令快速拒绝：HITL 之前的 fast-fail 黑名单（`sudo` / `rm -rf 全盘` / `mkfs` / `dd of=/dev` / fork bomb / `curl|sh` / `find /` / `chmod 777 /` / `shutdown`），减少 HITL 弹窗骚扰
-- `AuditLog` 结构化审计：危险工具调用按天写 JSONL 到 `~/.sharkcli/audit/`，含 `outcome (allow|deny|error)` 与 `approver (hitl|policy|none)`；`revert_turn` 也纳入危险工具链
+- `AuditLog` 结构化审计：危险工具调用按天写 JSONL 到 `~/.paicli/audit/`，含 `outcome (allow|deny|error)` 与 `approver (hitl|policy|none)`；`revert_turn` 也纳入危险工具链
 - `write_file` 单文件 5MB 上限
 - CLI 命令：`/policy` 查看安全策略状态、`/audit [N]` 看最近 N 条审计
 
@@ -236,7 +236,7 @@ v16.1 抽出 `Renderer` 接口 + 三个实现：
 当前启动输出以命令行实际产物为准：
 
 ```text
-   ████████    sharkCli π  v16.1.0
+   ████████    PaiCLI π  v16.1.0
      ██  ██    Model step-3.5-flash-2603 (step)
      ██  ██    MCP 4/4 · 61 tools · 2/2 skills · ReAct
      ██  ██    ReAct · Plan · MCP · Browser · Image
@@ -306,7 +306,7 @@ Tips for getting started:
 
 - 🔄 GLM-5.1、GLM-5V-Turbo、DeepSeek V4、阶跃星辰 StepFun 与 Kimi K2.6 多模型，`/model glm-5.1` / `/model glm-5v-turbo` 明确切 GLM 模型，`/model deepseek` / `/model step` / `/model kimi` 读取配置模型
 - 🧱 `LlmClient` 接口 + 模板方法基类，新增 provider 只需 ~20 行
-- 💾 默认模型持久化到 `~/.sharkcli/config.json`
+- 💾 默认模型持久化到 `~/.paicli/config.json`
 
 ### 第九期
 
@@ -320,7 +320,7 @@ Tips for getting started:
 - 🛡️ 路径围栏：文件类工具强制限定在项目根之内，绝对路径外逃 / `..` 穿越 / 符号链接逃逸全部拦截
 - 🧯 命令快速拒绝：HITL 之前的 fast-fail 黑名单（`sudo` / `rm -rf 全盘` / `mkfs` / `dd of=/dev` / fork bomb / `curl|sh` / `find /` / `chmod 777 /` / `shutdown`），减少 HITL 弹窗骚扰
 - 📦 资源上限：`write_file` 5MB；`execute_command` 60 秒超时 + 8KB 输出截断
-- 📋 结构化审计：危险工具调用按天写一行 JSONL 到 `~/.sharkcli/audit/`，可通过 `/audit [N]` 查看
+- 📋 结构化审计：危险工具调用按天写一行 JSONL 到 `~/.paicli/audit/`，可通过 `/audit [N]` 查看
 - 🧱 定位：HITL 之外的辅助层，不是沙箱、不提供进程隔离
 
 ## 快速开始
@@ -346,43 +346,43 @@ export KIMI_API_KEY=your_kimi_api_key_here
 export KIMI_MODEL=kimi-k2.6
 ```
 
-长期记忆默认保存在用户目录下的 `~/.sharkcli/memory/long_term_memory.json`。
+长期记忆默认保存在用户目录下的 `~/.paicli/memory/long_term_memory.json`。
 长期记忆只保存显式保存意图下的稳定事实：`/save <事实>`，或用户在自然语言里明确说“记一下 / 记住 / 以后记得”时由 Agent 调用 `save_memory`。它不应包含一次性任务请求或临时文件名/目录名。
-代码索引默认保存在 `~/.sharkcli/rag/codebase.db`。
-调试日志默认滚动写入 `~/.sharkcli/logs/sharkcli.log`，旧日志会按保留天数和总容量自动清理。
+代码索引默认保存在 `~/.paicli/rag/codebase.db`。
+调试日志默认滚动写入 `~/.paicli/logs/paicli.log`，旧日志会按保留天数和总容量自动清理。
 ReAct / Plan task / SubAgent / Planner 的模型 `reasoning_content` 会以 `LLM reasoning [...]` 形式写入该日志，便于排查模型为什么选择某个工具或路径。
 
 如果你想为某次运行指定单独目录，可以额外传入：
 
 ```bash
 # 指定记忆目录
-java -Dsharkcli.memory.dir=/tmp/sharkcli-memory -jar target/sharkcli-1.0-SNAPSHOT.jar
+java -Dpaicli.memory.dir=/tmp/paicli-memory -jar target/paicli-1.0-SNAPSHOT.jar
 
 # 指定 RAG 索引目录
-java -Dsharkcli.rag.dir=/tmp/sharkcli-rag -jar target/sharkcli-1.0-SNAPSHOT.jar
+java -Dpaicli.rag.dir=/tmp/paicli-rag -jar target/paicli-1.0-SNAPSHOT.jar
 
 # 指定日志目录与保留策略
-java -Dsharkcli.log.dir=/tmp/sharkcli-logs \
-     -Dsharkcli.log.level=DEBUG \
-     -Dsharkcli.log.maxHistory=3 \
-     -Dsharkcli.log.maxFileSize=5MB \
-     -Dsharkcli.log.totalSizeCap=20MB \
-     -jar target/sharkcli-1.0-SNAPSHOT.jar
+java -Dpaicli.log.dir=/tmp/paicli-logs \
+     -Dpaicli.log.level=DEBUG \
+     -Dpaicli.log.maxHistory=3 \
+     -Dpaicli.log.maxFileSize=5MB \
+     -Dpaicli.log.totalSizeCap=20MB \
+     -jar target/paicli-1.0-SNAPSHOT.jar
 ```
 
 也可以放到 `.env` 或环境变量中：
 
 ```bash
-SHARKCLI_LOG_LEVEL=DEBUG
-SHARKCLI_LOG_DIR=/Users/yourname/.sharkcli/logs
-SHARKCLI_LOG_MAX_HISTORY=7
-SHARKCLI_LOG_MAX_FILE_SIZE=10MB
-SHARKCLI_LOG_TOTAL_SIZE_CAP=100MB
+PAICLI_LOG_LEVEL=DEBUG
+PAICLI_LOG_DIR=/Users/yourname/.paicli/logs
+PAICLI_LOG_MAX_HISTORY=7
+PAICLI_LOG_MAX_FILE_SIZE=10MB
+PAICLI_LOG_TOTAL_SIZE_CAP=100MB
 ```
 
 ### 2. 可选：配置 MCP server
 
-MCP 子系统默认开启。`~/.sharkcli/mcp.json` 不存在时，sharkCli 会自动创建默认 chrome-devtools 配置：
+MCP 子系统默认开启。`~/.paicli/mcp.json` 不存在时，PaiCLI 会自动创建默认 chrome-devtools 配置：
 
 ```json
 {
@@ -395,7 +395,7 @@ MCP 子系统默认开启。`~/.sharkcli/mcp.json` 不存在时，sharkCli 会�
 }
 ```
 
-需要继续接入其他 server 时，可编辑 `~/.sharkcli/mcp.json` 或项目内 `.sharkcli/mcp.json`：
+需要继续接入其他 server 时，可编辑 `~/.paicli/mcp.json` 或项目内 `.paicli/mcp.json`：
 
 ```json
 {
@@ -422,16 +422,16 @@ MCP 子系统默认开启。`~/.sharkcli/mcp.json` 不存在时，sharkCli 会�
 
 ```bash
 # macOS
-open -na "Google Chrome" --args --remote-debugging-port=9222 --user-data-dir=/tmp/sharkcli-chrome-profile
+open -na "Google Chrome" --args --remote-debugging-port=9222 --user-data-dir=/tmp/paicli-chrome-profile
 
 # Windows
-start chrome.exe --remote-debugging-port=9222 --user-data-dir=%TEMP%\sharkcli-chrome-profile
+start chrome.exe --remote-debugging-port=9222 --user-data-dir=%TEMP%\paicli-chrome-profile
 
 # Linux
-google-chrome --remote-debugging-port=9222 --user-data-dir=/tmp/sharkcli-chrome-profile
+google-chrome --remote-debugging-port=9222 --user-data-dir=/tmp/paicli-chrome-profile
 ```
 
-通常不需要用户预先切换；Agent 如果遇到登录页会自己调用 `browser_connect`。手工调试时也可以在 sharkCli 内执行：
+通常不需要用户预先切换；Agent 如果遇到登录页会自己调用 `browser_connect`。手工调试时也可以在 PaiCLI 内执行：
 
 ```text
 /browser status
@@ -440,7 +440,7 @@ google-chrome --remote-debugging-port=9222 --user-data-dir=/tmp/sharkcli-chrome-
 /browser disconnect
 ```
 
-`/browser connect` 只在当前进程内把 `chrome-devtools` 切到 shared 模式，不会改写 `~/.sharkcli/mcp.json`。如果希望启动后默认 shared，可手动把 args 改为：
+`/browser connect` 只在当前进程内把 `chrome-devtools` 切到 shared 模式，不会改写 `~/.paicli/mcp.json`。如果希望启动后默认 shared，可手动把 args 改为：
 
 ```json
 ["-y", "chrome-devtools-mcp@latest", "--autoConnect"]
@@ -477,13 +477,13 @@ OAuth 和 `sampling/createMessage` 当前未实现；远程 server 需要鉴权�
 mvn clean package
 
 # 运行（需要本地 Ollama 已启动且拉取了 nomic-embed-text）
-java -jar target/sharkcli-1.0-SNAPSHOT.jar
+java -jar target/paicli-1.0-SNAPSHOT.jar
 ```
 
 或者直接运行：
 
 ```bash
-mvn clean compile exec:java -Dexec.mainClass="com.sharkcli.cli.Main"
+mvn clean compile exec:java -Dexec.mainClass="com.paicli.cli.Main"
 ```
 
 ### 4. 如何进入 Plan 模式
@@ -638,7 +638,7 @@ I
 ### 第三期：当前运行效果
 
 ```text
-   ████████    sharkCli π  v16.1.0
+   ████████    PaiCLI π  v16.1.0
      ██  ██    Model glm-5.1 (glm)
      ██  ██    MCP 4/4 · 61 tools · 2/2 skills · ReAct
      ██  ██    ReAct · Plan · MCP · Browser · Image
@@ -678,7 +678,7 @@ Tips for getting started:
 ## 项目结构
 
 ```
-src/main/java/com/sharkcli
+src/main/java/com/paicli
 ├── agent/
 │   ├── Agent.java              # ReAct Agent
 │   ├── PlanExecuteAgent.java   # Plan-and-Execute Agent
